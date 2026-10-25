@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tomllib
@@ -26,6 +27,8 @@ import config as config_module  # noqa: E402
 
 CONFIG_PATH = PLUGIN_ROOT / "config.example.toml"
 README_PATH = PLUGIN_ROOT / "README.md"
+CHANGELOG_PATH = PLUGIN_ROOT / "CHANGELOG.md"
+MANIFEST_PATH = PLUGIN_ROOT / "_manifest.json"
 
 # [[streams]] 在模板里是注释掉的示例（默认没有白名单会话），
 # 所以单独校验它的字段有没有在 README 里说明。
@@ -234,6 +237,58 @@ class CommandDocTests(unittest.TestCase):
                 declared,
                 f"README 说 {primary} 有别名 {alias}，但代码里没声明",
             )
+
+
+class ChangelogTests(unittest.TestCase):
+    """版本迭代必须同步更新 CHANGELOG.md 与 README 的版本号。"""
+
+    VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
+    HEADING_RE = re.compile(r"^##\s*\[(\d+\.\d+\.\d+)\]", re.MULTILINE)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        cls.changelog = CHANGELOG_PATH.read_text(encoding="utf-8")
+        cls.readme = README_PATH.read_text(encoding="utf-8")
+        cls.versions = cls.HEADING_RE.findall(cls.changelog)
+
+    def test_changelog_exists_and_is_utf8(self) -> None:
+        self.assertTrue(CHANGELOG_PATH.is_file(), "缺少 CHANGELOG.md")
+        raw = CHANGELOG_PATH.read_bytes()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "CHANGELOG.md 不能带 BOM")
+
+    def test_current_version_is_documented(self) -> None:
+        current = str(self.manifest["version"])
+        self.assertIn(
+            current,
+            self.versions,
+            f"CHANGELOG.md 缺少当前版本 {current} 的小节",
+        )
+
+    def test_versions_are_descending(self) -> None:
+        def key(value: str) -> tuple[int, ...]:
+            return tuple(int(part) for part in value.split("."))
+
+        ordered = [key(v) for v in self.versions]
+        self.assertEqual(
+            ordered,
+            sorted(ordered, reverse=True),
+            f"CHANGELOG.md 版本小节没有按从新到旧排列：{self.versions}",
+        )
+
+    def test_every_readme_version_appears_in_changelog(self) -> None:
+        mentioned = set(self.VERSION_RE.findall(self.readme))
+        missing = sorted(v for v in mentioned if v not in self.versions)
+        self.assertEqual(
+            missing, [], f"README 提到了这些版本，但 CHANGELOG.md 里没有：{missing}"
+        )
+
+    def test_manifest_version_matches_config_version(self) -> None:
+        self.assertEqual(
+            str(self.manifest["version"]),
+            config_module.BilibiliInterestShareConfig().plugin.config_version,
+            "_manifest.json 的 version 与 [plugin].config_version 必须一致",
+        )
 
 
 if __name__ == "__main__":
