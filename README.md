@@ -21,6 +21,14 @@ v1.0.1 按插件市场审核意见做了整改：
 - **重发也受白名单约束**：`/再发一遍` 这类重发只对白名单会话生效。
 - 清理了声明但未使用的 `chat.get_all_streams` 能力；`_manifest.json` 补上 `plugin_type: "integration"`，`host_application.max_version` 收窄为 `1.3.99`。
 
+v1.0.2 补齐了三个「文档里写了、代码却没读」的配置项，并修了分类归属的一个小 bug：
+
+- `[sources].search_pages` 现在真的会按页数翻页搜索（之前永远只取第 1 页）。
+- `[[categories]].min_play` 现在真的生效（之前只有 `[filter].min_play` 起作用，类别级门槛被忽略）。
+- `[reshare].reply_enabled` 现在真的生效（重发成功后回一句「好嘞，再发一遍～」，可关掉）。
+- 修了「普通关键词搜索先把 bvid 记成无分类、导致后面按分类搜到的类别补不上」的问题，`[[categories]]` 的类别过滤与类别门槛才能正常匹配。
+- `HookMode` 改为从文档推荐的 `maibot_sdk.types` 导入（保留对旧版 SDK 的兼容回退）。
+
 ---
 
 ## 功能一览
@@ -111,7 +119,7 @@ github.TommyAAKK.bilibili_interest_share/
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 是否启用插件（`false` 时完全不工作） |
-| `config_version` | `"1.0.1"` | 配置版本号，由插件维护，一般不要手动改 |
+| `config_version` | `"1.0.2"` | 配置版本号，由插件维护，一般不要手动改 |
 
 ### `[schedule]` 频率
 
@@ -287,7 +295,7 @@ min_play = 1000
 | `history_keywords` | 见配置 | 指代词，消息里还要出现其中之一（之前/上次/那个/你发过…） |
 | `match_window_days` | `60` | 在多长时间内的分享记录里查找（天） |
 | `min_match_score` | `0.25` | 标题模糊匹配的最低相似度（0~1，越低越宽松） |
-| `reply_enabled` | `true` | 重发后是否回一句确认（如「好，再发一遍～」） |
+| `reply_enabled` | `true` | 重发后是否回一句确认（如「好嘞，再发一遍～」） |
 
 同时命中「触发词 + 指代词」才会触发，避免误判；重发时**直接复用当时存下的介绍文案和推荐语**，不会重新生成。
 

@@ -64,7 +64,7 @@ def base_config(**overrides):
     """返回一份“一定会分享”的测试配置（默认关闭 LLM/抽帧/弹幕，保证确定性）。"""
 
     config = {
-        "plugin": {"enabled": True, "config_version": "1.0.1"},
+        "plugin": {"enabled": True, "config_version": "1.0.2"},
         "schedule": {
             "interval_minutes": 30,
             "jitter_seconds": 0,
@@ -147,7 +147,6 @@ def base_config(**overrides):
             "personality": "",
             "reply_style": "",
             "style_hint": "",
-            "bot_config_path": "",
             "cache_seconds": 0,
         },
         "reshare": {"enabled": True},
@@ -866,7 +865,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults["schedule"]["interval_minutes"], 60)
         self.assertEqual(defaults["schedule"]["search_cooldown_seconds"], 300)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "1.0.1")
+        self.assertEqual(defaults["plugin"]["config_version"], "1.0.2")
         self.assertEqual(defaults["interest"]["llm_task_name"], "planner")
         self.assertEqual(defaults["vision"]["task_name"], "vlm")
         self.assertTrue(defaults["categories"])
@@ -967,7 +966,7 @@ class PackagingTest(unittest.TestCase):
             raw = tomllib.load(handle)
         plugin = load_plugin_module().BilibiliInterestSharePlugin()
         plugin.set_plugin_config(raw)  # 不应抛异常
-        self.assertEqual(plugin.config.plugin.config_version, "1.0.1")
+        self.assertEqual(plugin.config.plugin.config_version, "1.0.2")
         self.assertEqual(plugin.config.streams, [])
         self.assertTrue(plugin.config.categories)
         self.assertEqual(plugin.config.vision.task_name, "vlm")
@@ -1080,6 +1079,122 @@ class RecentMessagesSdkSignatureTests(unittest.IsolatedAsyncioTestCase):
         ]
         messages = await plugin._recent_messages("stream-1")
         self.assertEqual(messages, [])
+
+
+class ConfigFieldBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    """几个「配置项写了就得真生效」的行为，防止 schema 与实现对不上。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_dir = Path(self._tmp.name)
+        self.module = load_plugin_module()
+        self.video_module = load_submodule("bilibili")
+        self.ctx = FakeCtx(self.tmp_dir)
+
+    def _make_plugin(self, config, *, client=None):
+        plugin = self.module.BilibiliInterestSharePlugin()
+        plugin._set_context(self.ctx)
+        plugin.set_plugin_config(config)
+        plugin._client = client if client is not None else FakeClient()
+        plugin._store = self.module.SeenStore(
+            self.tmp_dir / "state.json", dedupe_days=30, max_records=1000
+        )
+        plugin._store.load()
+        plugin._data_dir = self.tmp_dir
+        return plugin
+
+    async def test_search_pages_is_respected(self) -> None:
+        """`[sources].search_pages = 2` 时每个关键词要搜两页。"""
+
+        client = FakeClient(videos=[make_video(self.video_module, bvid="BVSP")])
+        plugin = self._make_plugin(
+            base_config(
+                sources={"search_enabled": True, "search_pages": 2, "popular_enabled": False}
+            ),
+            client=client,
+        )
+        await plugin._fetch_candidates(["原神"])
+        self.assertEqual([call["page"] for call in client.search_calls], [1, 2])
+
+    async def test_category_min_play_filters_candidates(self) -> None:
+        """`[[categories]].min_play` 生效：播放量不够的候选被挡掉。"""
+
+        video = make_video(self.video_module, bvid="BVC1", title="原神新版本测评", play=120000)
+        stream = {
+            "name": "测试群",
+            "enabled": True,
+            "stream_id": "stream-1",
+            "group_id": "",
+            "user_id": "",
+            "interests": ["原神"],
+            "categories": ["游戏"],
+            "auto_interest": False,
+            "max_share_per_round": 0,
+        }
+        category = {
+            "name": "游戏",
+            "enabled": True,
+            "keywords": ["原神"],
+            "search_order": "",
+            "min_play": 10_000_000,
+        }
+        strict = base_config(
+            sources={"search_enabled": True, "popular_enabled": False},
+            categories=[category],
+            streams=[stream],
+        )
+        plugin = self._make_plugin(strict, client=FakeClient(videos=[video]))
+        summary = await plugin.run_round(reason="test")
+        self.assertEqual(summary["shared"], 0)
+
+        # 同样的候选，把类别门槛降为 0 就能分享
+        relaxed = deep_merge(
+            strict, {"categories": [dict(category, min_play=0)]}
+        )
+        self.ctx.send.messages.clear()
+        plugin2 = self._make_plugin(relaxed, client=FakeClient(videos=[video]))
+        summary2 = await plugin2.run_round(reason="test")
+        self.assertEqual(summary2["shared"], 1)
+
+    async def test_reshare_reply_enabled_sends_confirmation(self) -> None:
+        """`[reshare].reply_enabled = true` 时重发后回一句确认。"""
+
+        video = make_video(self.video_module, bvid="BVRP", title="原神新版本测评")
+        plugin = self._make_plugin(
+            base_config(reshare={"enabled": True, "reply_enabled": True})
+        )
+        plugin._store.mark_shared(
+            video, narrative="缓存介绍文案", kind="auto", stream_id="stream-1"
+        )
+        await plugin._maybe_reshare(
+            {
+                "stream_id": "stream-1",
+                "session_id": "stream-1",
+                "processed_plain_text": "之前发的原神新版本测评再发一遍",
+            }
+        )
+        texts = [item["text"] for item in self.ctx.send.messages]
+        self.assertIn("好嘞，再发一遍～", texts)
+
+    async def test_reshare_reply_disabled_sends_no_confirmation(self) -> None:
+        video = make_video(self.video_module, bvid="BVRQ", title="原神新版本测评")
+        plugin = self._make_plugin(
+            base_config(reshare={"enabled": True, "reply_enabled": False})
+        )
+        plugin._store.mark_shared(
+            video, narrative="缓存介绍文案", kind="auto", stream_id="stream-1"
+        )
+        await plugin._maybe_reshare(
+            {
+                "stream_id": "stream-1",
+                "session_id": "stream-1",
+                "processed_plain_text": "之前发的原神新版本测评再发一遍",
+            }
+        )
+        texts = [item["text"] for item in self.ctx.send.messages]
+        self.assertNotIn("好嘞，再发一遍～", texts)
+        self.assertTrue(texts)
 
 
 if __name__ == "__main__":

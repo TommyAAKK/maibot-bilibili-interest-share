@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from maibot_sdk import Command, HookHandler, MaiBotPlugin
-from maibot_sdk.components import HookMode
+
+try:  # 文档推荐的导入路径（HookMode 定义在 types 里）
+    from maibot_sdk.types import HookMode
+except ImportError:  # 兼容把 HookMode 只在 components 里导出的旧版本 SDK
+    from maibot_sdk.components import HookMode
 
 from .bilibili import BilibiliClient, BilibiliError, Video, merge_videos
 from .config import BilibiliInterestShareConfig
@@ -447,6 +451,19 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             or not category_of.get(video.bvid)
             or category_of.get(video.bvid) in allowed
         ]
+        # 每个类别可以有自己的最低播放量（0 = 沿用 [filter].min_play）
+        category_min_play = {
+            category.name: int(category.min_play)
+            for category in config.categories
+            if category.min_play and category.min_play > 0
+        }
+        if category_min_play:
+            candidates = [
+                video
+                for video in candidates
+                if video.play
+                >= category_min_play.get(category_of.get(video.bvid, ""), 0)
+            ]
         # 已刷名单内的视频不再自动分享
         candidates = [video for video in candidates if not self._store.is_seen(video.bvid)]
         if not candidates:
@@ -660,20 +677,26 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             keyword = (keyword or "").strip()
             if not keyword:
                 return
-            attempts += 1
-            try:
-                found = await self._client.fetch_search(
-                    keyword, page=1, order=order or ""
-                )
-            except BilibiliError as exc:
-                failures += 1
-                logger.debug("搜索「%s」失败：%s", keyword, exc)
-                return
-            for video in found:
-                videos.append(video)
-                category_of.setdefault(video.bvid, category)
-            if delay:
-                await asyncio.sleep(delay)
+            pages = max(1, int(config.sources.search_pages))
+            for page in range(1, pages + 1):
+                attempts += 1
+                try:
+                    found = await self._client.fetch_search(
+                        keyword, page=page, order=order or ""
+                    )
+                except BilibiliError as exc:
+                    failures += 1
+                    logger.debug("搜索「%s」第 %s 页失败：%s", keyword, page, exc)
+                    return
+                for video in found:
+                    videos.append(video)
+                    # 先用普通关键词搜到的没有分类，后续按分类搜到时要补上
+                    if category or video.bvid not in category_of:
+                        category_of[video.bvid] = category
+                if not found:
+                    return
+                if delay:
+                    await asyncio.sleep(delay)
 
         if config.sources.search_enabled:
             for keyword in keywords:
@@ -1137,13 +1160,15 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         video = _video_from_record(record)
         if not video.bvid or not video.title:
             return
-        await self._send_parts(
+        sent = await self._send_parts(
             stream_id,
             video,
             str(record.get("narrative") or record.get("summary") or ""),
             kind="reshare",
             intro=str(record.get("intro") or ""),
         )
+        if sent and config.reshare.reply_enabled:
+            await self._send_text(stream_id, "好嘞，再发一遍～")
         logger.info("按用户要求重发了 %s（%s）", video.bvid, video.title)
 
     # -- 指令 ----------------------------------------------------------
