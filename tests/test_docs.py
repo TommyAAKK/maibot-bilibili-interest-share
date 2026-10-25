@@ -176,5 +176,65 @@ class ConfigFieldDescriptionTests(unittest.TestCase):
         self.assertEqual(missing, [], "\n".join(missing))
 
 
+class CommandDocTests(unittest.TestCase):
+    """README 指令表里写的指令和别名，代码里必须真的有。"""
+
+    ROW_RE = re.compile(
+        r"^\|\s*`(?P<primary>/[^\s`]+)[^`]*`\s*\|\s*(?P<alias>`/[^`]+`|—)\s*\|"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(PLUGIN_ROOT / "tests"))
+        from _helpers import load_plugin_module  # noqa: PLC0415
+
+        cls.module = load_plugin_module()
+        cls.commands = []
+        for attr in dir(cls.module.BilibiliInterestSharePlugin):
+            func = getattr(cls.module.BilibiliInterestSharePlugin, attr, None)
+            info = getattr(func, "__maibot_component_info__", None)
+            pattern = getattr(info, "command_pattern", "") or ""
+            if pattern:
+                cls.commands.append(
+                    {
+                        "pattern": pattern,
+                        "aliases": list(getattr(info, "aliases", []) or []),
+                    }
+                )
+        cls.rows = []
+        for line in README_PATH.read_text(encoding="utf-8").splitlines():
+            match = cls.ROW_RE.match(line.strip())
+            if match:
+                alias = match.group("alias")
+                cls.rows.append(
+                    (
+                        match.group("primary"),
+                        None if alias == "—" else alias.strip("`"),
+                    )
+                )
+
+    def test_readme_rows_exist(self) -> None:
+        self.assertTrue(self.rows, "README 里没解析到指令表")
+
+    def test_every_readme_command_is_declared(self) -> None:
+        patterns = [item["pattern"] for item in self.commands]
+        for primary, _alias in self.rows:
+            self.assertTrue(
+                any(pattern.startswith("^" + primary) for pattern in patterns),
+                f"README 写了 {primary}，但代码里没有对应指令",
+            )
+
+    def test_every_readme_alias_is_declared(self) -> None:
+        declared = {alias for item in self.commands for alias in item["aliases"]}
+        for primary, alias in self.rows:
+            if alias is None:
+                continue
+            self.assertIn(
+                alias,
+                declared,
+                f"README 说 {primary} 有别名 {alias}，但代码里没声明",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1173,7 +1173,12 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
 
     # -- 指令 ----------------------------------------------------------
 
-    @Command("bili_share", description="立即跑一轮 B 站分享", pattern=r"^/bili-share")
+    @Command(
+        "bili_share",
+        description="立即跑一轮 B 站分享",
+        pattern=r"^/bili-share",
+        aliases=["/b站分享"],
+    )
     async def cmd_share(self, **kwargs: Any) -> Tuple[bool, str, int]:
         stream_id = _stream_id_of(kwargs)
         summary = await self.run_round(reason="manual", manual=True)
@@ -1190,7 +1195,11 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             await self._send_text(stream_id, text)
         return True, text, 2
 
-    @Command("bili_test", description="预览本轮候选与打分（不发送）", pattern=r"^/bili-test")
+    @Command(
+        "bili_test",
+        description="预览本轮候选与打分（只预览，不分享视频）",
+        pattern=r"^/bili-test",
+    )
     async def cmd_test(self, **kwargs: Any) -> Tuple[bool, str, int]:
         stream_id = _stream_id_of(kwargs)
         text = await self._format_preview()

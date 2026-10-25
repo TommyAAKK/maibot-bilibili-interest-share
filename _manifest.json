@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.TommyAAKK.bilibili_interest_share",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "name": "麦麦刷B站",
   "description": "定时刷 B 站，按白名单聊天流的用户兴趣挑选有趣的视频分享。支持抽帧看画面、读弹幕与热门评论、LLM 语义判断与内容总结、按 MaiBot 人设口吻写分享文案、已刷名单、主动搜索与 /赤石视频。刷取频率可在配置中调节，每个配置项都带中文注释。",
   "author": {
