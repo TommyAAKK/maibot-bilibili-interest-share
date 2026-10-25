@@ -37,7 +37,7 @@ v1.0.0 是**首个公开发布版**：插件正式定名「麦麦刷B站」，�
 ## 目录结构
 
 ```
-maibot-bilibili-interest-share/
+github.TommyAAKK.bilibili_interest_share/
 ├── _manifest.json        # 插件清单（宿主识别用）
 ├── config.toml           # 默认配置（带注释，改这个）
 ├── config.py             # 配置模型（WebUI 表单由它生成）
@@ -63,8 +63,10 @@ maibot-bilibili-interest-share/
 1. 把整个目录复制到 MaiBot 的 `plugins/` 下：
 
    ```
-   <MaiBot 实例>/plugins/maibot-bilibili-interest-share/
+   <MaiBot 实例>/plugins/github.TommyAAKK.bilibili_interest_share/
    ```
+
+   > 目录名要和插件 ID 一致（宿主按 ID 导入插件）。从插件市场安装时会自动放到这个位置。
 
 2. 重启 MaiBot，或在 WebUI 的插件页启用 `github.TommyAAKK.bilibili_interest_share`。
 
