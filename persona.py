@@ -1,6 +1,6 @@
 """读取 MaiBot 宿主的人设配置，让分享文案贴合麦麦的人设。
 
-MaiBot 的人设写在宿主实例的 ``config/bot_config.toml`` 里：
+宿主的人设写在实例的 ``config/bot_config.toml`` 里：
 
 .. code-block:: toml
 
@@ -13,13 +13,20 @@ MaiBot 的人设写在宿主实例的 ``config/bot_config.toml`` 里：
     behavior_style = "……"
     reply_style = "你的风格可爱机灵又自然……"
 
-插件运行在宿主进程内，拿到的 ``ctx.paths.data_dir`` 形如
-``<实例根>/data/plugins/<插件ID>``，因此可以从它向上三级反推实例根目录，
-再读 ``config/bot_config.toml``。也可以用 ``[persona].bot_config_path`` 手动指定，
-或用 ``[persona].name`` / ``personality`` / ``reply_style`` 直接覆盖。
+插件不直接读这个文件，而是通过宿主提供的 ``config.get`` 能力按需取值
+（``bot.nickname`` / ``bot.alias_names`` / ``personality.personality`` /
+``personality.behavior_style`` / ``personality.reply_style``），
+这样既不用猜测实例目录结构，也符合插件的权限边界。
 
-配置了覆盖值时以覆盖值为准；否则读宿主文件；都拿不到就返回空人设，
-调用方会退化成中性语气（不会报错）。
+``config.get`` 是异步能力，因此本模块把读取拆成两步：
+
+* ``await provider.refresh()``：从宿主拉一次人设并缓存（插件在 on_load 和
+  每轮分享开始前调用，带 TTL，不会频繁请求）；
+* ``provider.get()`` / ``provider.prompt_block()``：同步读取缓存结果，
+  供同步的提示词拼装代码使用。
+
+配置里也可以用 ``[persona].name`` / ``personality`` / ``reply_style``
+直接覆盖对应字段；都拿不到人设时返回空人设，调用方退化成中性语气。
 """
 
 from __future__ import annotations
@@ -27,12 +34,27 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger("plugin.bilibili_interest_share.persona")
 
-BOT_CONFIG_RELATIVE = Path("config") / "bot_config.toml"
+# 宿主人设字段在全局配置里的键名
+KEY_NICKNAME = "bot.nickname"
+KEY_ALIASES = "bot.alias_names"
+KEY_PERSONALITY = "personality.personality"
+KEY_BEHAVIOR_STYLE = "personality.behavior_style"
+KEY_REPLY_STYLE = "personality.reply_style"
+
+HOST_KEYS = (
+    KEY_NICKNAME,
+    KEY_ALIASES,
+    KEY_PERSONALITY,
+    KEY_BEHAVIOR_STYLE,
+    KEY_REPLY_STYLE,
+)
+
+# config.get 的可调用类型：async (key, default) -> value
+ConfigGetter = Callable[[str, Any], Awaitable[Any]]
 
 
 @dataclass
@@ -69,58 +91,41 @@ class Persona:
         return "\n".join(lines)
 
 
-def find_instance_root(data_dir: Optional[Path]) -> Optional[Path]:
-    """从 ``<实例根>/data/plugins/<插件ID>`` 反推实例根目录。"""
+def _as_text(value: Any) -> str:
+    """把宿主配置值转成去掉首尾空白的字符串。"""
 
-    if data_dir is None:
-        return None
-    try:
-        path = Path(data_dir).resolve()
-    except (OSError, TypeError, ValueError):
-        return None
-    # data_dir 的期望结构：root / data / plugins / <plugin_id>
-    if len(path.parents) < 3:
-        return None
-    if path.parent.name != "plugins" or path.parent.parent.name != "data":
-        return None
-    return path.parent.parent.parent
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
-def load_persona_from_toml(path: Path) -> Persona:
-    """从 ``bot_config.toml`` 读取人设；解析失败返回空人设。"""
+def _as_aliases(value: Any) -> List[str]:
+    """把宿主配置里的别名列表规整成字符串列表。"""
 
-    try:
-        import tomllib
-    except ImportError:  # pragma: no cover - Python < 3.11
-        logger.debug("当前 Python 没有 tomllib，无法读取宿主人设")
-        return Persona()
+    if isinstance(value, str):
+        items: List[Any] = [item for item in value.replace("，", ",").split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return []
+    aliases: List[str] = []
+    for item in items:
+        text = _as_text(item)
+        if text and text not in aliases:
+            aliases.append(text)
+    return aliases
 
-    try:
-        with open(path, "rb") as handle:
-            data = tomllib.load(handle)
-    except (OSError, ValueError) as exc:
-        logger.debug("读取宿主人设失败（%s）：%s", path, exc)
-        return Persona()
 
-    if not isinstance(data, dict):
-        return Persona()
-    bot = data.get("bot") if isinstance(data.get("bot"), dict) else {}
-    personality_section = (
-        data.get("personality") if isinstance(data.get("personality"), dict) else {}
-    )
-
-    aliases_raw = bot.get("alias_names")
-    aliases = [str(item).strip() for item in aliases_raw if str(item).strip()] if isinstance(
-        aliases_raw, list
-    ) else []
+def build_persona(values: Dict[str, Any], *, source: str = "host") -> Persona:
+    """用 ``config.get`` 的取值结果拼出一份人设。"""
 
     persona = Persona(
-        name=str(bot.get("nickname") or "").strip(),
-        personality=str(personality_section.get("personality") or "").strip(),
-        reply_style=str(personality_section.get("reply_style") or "").strip(),
-        behavior_style=str(personality_section.get("behavior_style") or "").strip(),
-        aliases=aliases,
-        source="host",
+        name=_as_text(values.get(KEY_NICKNAME)),
+        personality=_as_text(values.get(KEY_PERSONALITY)),
+        reply_style=_as_text(values.get(KEY_REPLY_STYLE)),
+        behavior_style=_as_text(values.get(KEY_BEHAVIOR_STYLE)),
+        aliases=_as_aliases(values.get(KEY_ALIASES)),
+        source=source,
     )
     if persona.is_empty:
         return Persona()
@@ -134,90 +139,89 @@ class PersonaProvider:
         self,
         *,
         enabled: bool = True,
-        data_dir: Optional[Path] = None,
+        config_get: Optional[ConfigGetter] = None,
         override_name: str = "",
         override_personality: str = "",
         override_reply_style: str = "",
         style_hint: str = "",
-        config_path: str = "",
         cache_seconds: int = 120,
     ) -> None:
         self.enabled = bool(enabled)
-        self.data_dir = data_dir
+        self.config_get = config_get
         self.override_name = (override_name or "").strip()
         self.override_personality = (override_personality or "").strip()
         self.override_reply_style = (override_reply_style or "").strip()
         self.style_hint = (style_hint or "").strip()
-        self.config_path = (config_path or "").strip()
         self.cache_seconds = max(0, int(cache_seconds or 0))
         self._cached: Optional[Persona] = None
         self._cached_at: float = 0.0
-        self._cached_mtime: Optional[float] = None
-
-    # -- 路径 ----------------------------------------------------------
-
-    def resolve_config_path(self) -> Optional[Path]:
-        """定位 ``bot_config.toml``。"""
-
-        if self.config_path:
-            path = Path(self.config_path).expanduser()
-            return path if path.is_file() else None
-        root = find_instance_root(self.data_dir)
-        if root is None:
-            return None
-        candidate = root / BOT_CONFIG_RELATIVE
-        return candidate if candidate.is_file() else None
 
     # -- 读取 ----------------------------------------------------------
 
-    def _load(self) -> Persona:
-        if not self.enabled:
+    async def _read_host(self) -> Persona:
+        """通过宿主 ``config.get`` 能力读人设。"""
+
+        getter = self.config_get
+        if getter is None:
             return Persona()
-        # 有任意覆盖值就用覆盖值（缺失的字段仍可从宿主补齐）
-        host = Persona()
-        path = self.resolve_config_path()
-        if path is not None:
-            host = load_persona_from_toml(path)
+        values: Dict[str, Any] = {}
+        for key in HOST_KEYS:
+            try:
+                values[key] = await getter(key, "")
+            except Exception as exc:  # noqa: BLE001 - 读不到人设不算错误
+                logger.debug("读取宿主人设字段 %s 失败：%s", key, exc)
+                values[key] = ""
+        return build_persona(values, source="host")
+
+    async def refresh(self) -> Persona:
+        """从宿主重新拉取人设并写缓存；禁用或失败时缓存空人设。"""
+
+        if not self.enabled:
+            self._cached = Persona()
+            self._cached_at = time.time()
+            return self._cached
+
+        host = await self._read_host()
         persona = Persona(
             name=self.override_name or host.name,
             personality=self.override_personality or host.personality,
             reply_style=self.override_reply_style or host.reply_style,
             behavior_style=host.behavior_style,
             aliases=list(host.aliases),
-            source="override" if (self.override_name or self.override_personality or self.override_reply_style) else host.source,
+            source=(
+                "override"
+                if (self.override_name or self.override_personality or self.override_reply_style)
+                else host.source
+            ),
         )
         if persona.is_empty:
-            return Persona()
+            persona = Persona()
+        self._cached = persona
+        self._cached_at = time.time()
         return persona
+
+    def needs_refresh(self) -> bool:
+        """缓存是否已过期（或从未拉取过）。"""
+
+        if self._cached is None:
+            return True
+        return (time.time() - self._cached_at) >= self.cache_seconds
+
+    async def ensure(self) -> Persona:
+        """需要时刷新，否则直接返回缓存。"""
+
+        if self.needs_refresh():
+            return await self.refresh()
+        return self._cached or Persona()
 
     def get(self) -> Persona:
-        """取人设（带 TTL 与 mtime 双重缓存）。"""
+        """同步读取缓存的人设；还没拉取过时返回空人设。"""
 
-        now = time.time()
-        path = self.resolve_config_path()
-        mtime: Optional[float] = None
-        if path is not None:
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                mtime = None
-        fresh = (
-            self._cached is not None
-            and (now - self._cached_at) < self.cache_seconds
-            and mtime == self._cached_mtime
-        )
-        if fresh:
-            return self._cached  # type: ignore[return-value]
-        persona = self._load()
-        self._cached = persona
-        self._cached_at = now
-        self._cached_mtime = mtime
-        return persona
+        return self._cached or Persona()
 
     def invalidate(self) -> None:
         self._cached = None
         self._cached_at = 0.0
-        self._cached_mtime = None
 
     def prompt_block(self) -> str:
         """给人设段落加上额外风格提示。"""

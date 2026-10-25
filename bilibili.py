@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
 import re
 import time
 import urllib.parse
@@ -49,6 +50,79 @@ _EM_TAG_RE = re.compile(r"</?em[^>]*>")
 
 class BilibiliError(RuntimeError):
     """B 站接口请求或数据解析失败。"""
+
+
+# 下载地址安全策略：B 站返回的播放地址/字幕地址会被直接用于下载，
+# 因此只放行 http/https，并拒绝指向本机、内网、链路本地等地址的 URL，
+# 避免被上游数据诱导去访问内网服务（SSRF）。
+_ALLOWED_DOWNLOAD_SCHEMES = frozenset({"http", "https"})
+_PRIVATE_HOST_SUFFIXES = (
+    ".local",
+    ".localhost",
+    ".localdomain",
+    ".internal",
+    ".intranet",
+    ".lan",
+    ".home",
+    ".corp",
+)
+_PRIVATE_HOSTS = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
+_MAX_DOWNLOAD_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+def _is_private_host(host: str) -> bool:
+    """判断主机名是否指向本机/内网（IP 字面量或私有域名后缀）。"""
+
+    host = (host or "").strip().lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if not host:
+        return True
+    if host in _PRIVATE_HOSTS:
+        return True
+    if host.endswith(_PRIVATE_HOST_SUFFIXES):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
+
+
+def ensure_safe_download_url(url: str) -> str:
+    """校验下载地址，返回原始字符串；不安全时抛 :class:`BilibiliError`。"""
+
+    text = (url or "").strip()
+    if not text:
+        raise BilibiliError("下载地址为空")
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError as exc:
+        raise BilibiliError(f"下载地址无法解析：{exc}") from exc
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_DOWNLOAD_SCHEMES:
+        raise BilibiliError(f"下载地址协议不受支持：{scheme or '空'}")
+    host = parsed.hostname or ""
+    if _is_private_host(host):
+        raise BilibiliError(f"下载地址指向本机或内网，已拒绝：{host or '空'}")
+    return text
+
+
+def _safe_or_empty(url: str) -> str:
+    """校验通过就返回原地址，否则返回空串。"""
+
+    try:
+        return ensure_safe_download_url(url)
+    except BilibiliError:
+        return ""
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -664,6 +738,10 @@ class BilibiliDetailMixin:
         if url.startswith("//"):
             url = "https:" + url
         try:
+            url = ensure_safe_download_url(url)
+        except BilibiliError:
+            return ""
+        try:
             response = await self._client.get(url)  # type: ignore[attr-defined]
             payload = response.json()
         except Exception:  # noqa: BLE001
@@ -708,7 +786,7 @@ class BilibiliDetailMixin:
             return ""
         durl = data.get("durl")
         if isinstance(durl, list) and durl and isinstance(durl[0], dict):
-            return _as_str(durl[0].get("url")).strip()
+            return _safe_or_empty(_as_str(durl[0].get("url")).strip())
         dash = data.get("dash") if isinstance(data.get("dash"), dict) else None
         if dash:
             videos = dash.get("video")
@@ -718,31 +796,49 @@ class BilibiliDetailMixin:
                 if candidates:
                     base = _as_str(candidates[0].get("baseUrl") or candidates[0].get("base_url"))
                     if base:
-                        return base.strip()
+                        return _safe_or_empty(base.strip())
         return ""
 
     async def download_to(self, url: str, dest: Path, *, max_bytes: int = 80 * 1024 * 1024) -> Path:
-        """流式下载到本地文件，超过 ``max_bytes`` 时中止。"""
+        """流式下载到本地文件，超过 ``max_bytes`` 时中止。
 
-        url = (url or "").strip()
-        if not url:
-            raise BilibiliError("下载地址为空")
+        下载地址来自 B 站接口返回，因此这里手动跟随重定向：每一跳都重新做
+        协议与主机校验（拒绝本机/内网地址），最多 5 跳。
+        """
+
+        url = ensure_safe_download_url(url)
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         client = self._client  # type: ignore[attr-defined]
         written = 0
+        current = url
         try:
-            async with client.stream("GET", url) as response:
-                if response.status_code != 200:
-                    raise BilibiliError(f"下载视频失败：HTTP {response.status_code}")
-                with dest.open("wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
-                            continue
-                        written += len(chunk)
-                        if written > max_bytes:
-                            raise BilibiliError("视频体积超过上限，跳过抽帧")
-                        handle.write(chunk)
+            for _ in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+                async with client.stream(
+                    "GET", current, follow_redirects=False
+                ) as response:
+                    status = response.status_code
+                    if status in _REDIRECT_STATUSES:
+                        location = response.headers.get("location", "")
+                        if not location:
+                            raise BilibiliError("下载重定向缺少目标地址")
+                        current = ensure_safe_download_url(
+                            urllib.parse.urljoin(current, location)
+                        )
+                        continue
+                    if status != 200:
+                        raise BilibiliError(f"下载视频失败：HTTP {status}")
+                    with dest.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            if not chunk:
+                                continue
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise BilibiliError("视频体积超过上限，跳过抽帧")
+                            handle.write(chunk)
+                    break
+            else:
+                raise BilibiliError("下载重定向次数过多")
         except httpx.HTTPError as exc:
             raise BilibiliError(f"下载视频失败：{exc}") from exc
         if written == 0:

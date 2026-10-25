@@ -10,7 +10,16 @@ v0.4.1 修了两个只在真实 MaiBot 实例里才会暴露的问题：`message
 
 v0.4.2 把**每个配置项都补上了中文注释**：`config.toml` 里每个键上方都有一行紧邻的中文说明，下面「配置说明」也逐项列出了全部配置项（默认值 + 含义）；并加了文档一致性测试，防止以后加配置忘了写注释或忘了更新 README。
 
-v1.0.0 是**首个公开发布版**：插件正式定名「麦麦刷B站」，发布到麦麦插件市场；`_manifest.json` 的 `version` 与 `config.toml` / `config.py` 里的 `config_version` 统一为 `1.0.0`，发布包的配置全部还原为初始默认值。
+v1.0.0 是**首个公开发布版**：插件正式定名「麦麦刷B站」，发布到麦麦插件市场；`_manifest.json` 的 `version` 与 `config.py` 里的 `config_version` 统一为 `1.0.0`，发布包的配置全部还原为初始默认值。
+
+v1.0.1 按插件市场审核意见做了整改：
+
+- **配置文件不再随仓库发布**。运行时的 `config.toml` 由 MaiBot 按插件 schema 自动生成，仓库里改为提供带中文注释的参考模板 `config.example.toml`（值与默认值逐项一致，可直接复制成 `config.toml` 使用）。
+- **人设改走能力边界**：不再反推实例目录、直接读 `config/bot_config.toml`，改为通过宿主 `config.get` 能力读 `bot.nickname` 等字段，并声明了 `config.get` 能力。
+- **下载地址做安全校验**：B 站返回的播放地址/字幕地址只放行 `http`/`https`，拒绝本机与内网地址，重定向每一跳都重新校验（防 SSRF）。
+- **`bvid` 做路径校验**：只有匹配 `^BV[0-9A-Za-z]+$` 的才会被当作目录名，避免上游数据里出现 `../` 之类越界路径。
+- **重发也受白名单约束**：`/再发一遍` 这类重发只对白名单会话生效。
+- 清理了声明但未使用的 `chat.get_all_streams` 能力；`_manifest.json` 补上 `plugin_type: "integration"`，`host_application.max_version` 收窄为 `1.3.99`。
 
 ---
 
@@ -29,7 +38,7 @@ v1.0.0 是**首个公开发布版**：插件正式定名「麦麦刷B站」，�
 | 主动搜索 | `/bili-search 关键词`，独立冷却（默认 5 分钟），不影响自动频率 |
 | 自然语言重发 | 聊天里说「你之前发的那个 XX 再发一遍」，插件从历史记录里找回并**复用当时的介绍文案**重发 |
 | 赤石视频 | `/赤石视频` 抓一个抽象整活类视频，**只发标题+链接，不带介绍** |
-| 人设语气 | 推荐语和介绍文案按 MaiBot 的**麦麦人设**（`bot_config.toml`）口吻生成，可覆盖、可关 |
+| 人设语气 | 推荐语和介绍文案按 MaiBot 的**麦麦人设**口吻生成（通过 `config.get` 能力读宿主配置），可覆盖、可关 |
 | 可观测 | `/bili-status` 看状态、`/bili-test` 预览本轮打分（不发送） |
 
 ---
@@ -39,7 +48,7 @@ v1.0.0 是**首个公开发布版**：插件正式定名「麦麦刷B站」，�
 ```
 github.TommyAAKK.bilibili_interest_share/
 ├── _manifest.json        # 插件清单（宿主识别用）
-├── config.toml           # 默认配置（带注释，改这个）
+├── config.example.toml   # 带中文注释的配置参考模板（可复制成 config.toml）
 ├── config.py             # 配置模型（WebUI 表单由它生成）
 ├── plugin.py             # 插件主体：调度、抓取、打分、分享、指令、Hook
 ├── bilibili.py           # B 站接口客户端（WBI 签名、搜索、详情、弹幕、评论、字幕）
@@ -47,13 +56,13 @@ github.TommyAAKK.bilibili_interest_share/
 ├── textfilter.py         # AI 鱼灾弹幕/评论过滤
 ├── media.py              # 取流下载 + ffmpeg 抽帧
 ├── llm_judge.py          # LLM 语义判断、自然语言介绍、推荐语
-├── persona.py            # 读取 MaiBot 人设（bot_config.toml），提供人设提示词
+├── persona.py            # 通过宿主 config.get 能力读人设，提供人设提示词
 ├── store.py              # 去重名单、分享历史、冷却状态（state.json）
 ├── tools/
 │   ├── live_check.py     # 真实联网自检（可选抽帧/弹幕/LLM/赤石）
 │   ├── probe_persona.py  # 人设自检：打印读到的人设 + 注入后的 prompt（不调用模型）
 │   └── probe_vision.py   # 单独验证「下载 + 抽帧」链路
-└── tests/                # unittest 单元测试（103 个用例）
+└── tests/                # unittest 单元测试（116 个用例）
 ```
 
 ---
@@ -70,7 +79,7 @@ github.TommyAAKK.bilibili_interest_share/
 
 2. 重启 MaiBot，或在 WebUI 的插件页启用 `github.TommyAAKK.bilibili_interest_share`。
 
-3. 打开 `config.toml`，**至少填一个 `[[streams]]`**（白名单），否则不会分享给任何会话：
+3. 首次启动后，MaiBot 会在插件目录下自动生成 `config.toml`。打开它，**至少填一个 `[[streams]]`**（白名单），否则不会分享给任何会话：
 
    ```toml
    [[streams]]
@@ -83,13 +92,17 @@ github.TommyAAKK.bilibili_interest_share/
 
    找不到群号？先在群里发一句 `/bili-status`，日志会打印解析到的会话信息；也可以把 `stream_id` 直接填上（优先级最高）。
 
-插件**不依赖额外 pip 包**：HTTP 用宿主自带的 `httpx`；抽帧用的 `ffmpeg` 会优先从 `imageio-ffmpeg`（MaiBot 环境里通常已装）里找，找不到再查 PATH，也可以用 `[advanced].ffmpeg_path` 手动指定。
+   > 仓库里的 `config.example.toml` 是同一份配置的**带中文注释版模板**：想直接看注释版，把它复制成 `config.toml` 即可（值完全一致）。自动生成的 `config.toml` 不含注释，但 WebUI 表单里每一项都有中文说明。
+
+插件**不依赖额外 pip 包**：HTTP 用宿主自带的 `httpx`。
+
+**抽帧识图需要 ffmpeg**（可选功能）：优先用 `[advanced].ffmpeg_path`，其次找 `imageio-ffmpeg`（MaiBot 环境里通常已装），最后查系统 `PATH`。三者都没有时会自动跳过抽帧，其余流程正常。如果希望开箱即用，请确认运行 MaiBot 的环境里 `PATH` 有 `ffmpeg`，或装了 `imageio-ffmpeg`。
 
 ---
 
 ## 配置说明
 
-配置按 section 分组，WebUI 会自动渲染成表单。下面**逐项说明全部配置项**（`config.toml` 里每个键上方也有一行中文注释，两处含义一致）。
+配置按 section 分组，WebUI 会自动渲染成表单。下面**逐项说明全部配置项**（`config.example.toml` 里每个键上方也有一行中文注释，两处含义一致）。
 
 > 改完 `config.toml` 保存即可，MaiBot 会自动重载插件配置，不用重启。
 
@@ -98,7 +111,7 @@ github.TommyAAKK.bilibili_interest_share/
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 是否启用插件（`false` 时完全不工作） |
-| `config_version` | `"1.0.0"` | 配置版本号，由插件维护，一般不要手动改 |
+| `config_version` | `"1.0.1"` | 配置版本号，由插件维护，一般不要手动改 |
 
 ### `[schedule]` 频率
 
@@ -128,7 +141,7 @@ github.TommyAAKK.bilibili_interest_share/
 
 ### `[[categories]]` 主动分享的内容类别
 
-默认四类，可增删改关键词。`config.toml` 里自带的是下面这四类：
+默认四类，可增删改关键词。`config.example.toml` 里自带的是下面这四类：
 
 ```toml
 [[categories]]
@@ -257,12 +270,11 @@ min_play = 1000
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 是否启用人设语气 |
-| `bot_config_path` | `""` | 人设文件路径；留空则自动从插件数据目录反推实例根目录，读取 `config/bot_config.toml` |
 | `name` / `personality` / `reply_style` | `""` | 手动覆盖人设字段；留空则用宿主的，非空则覆盖对应字段 |
 | `style_hint` | `""` | 追加给 LLM 的额外要求，如「多提一句视频看点」 |
-| `cache_seconds` | `120` | 人设缓存时间（同时按文件 mtime 失效，改了 `bot_config.toml` 会自动重读） |
+| `cache_seconds` | `120` | 人设缓存时间（秒）；过期后下次分享前自动重新读一次 |
 
-读取的字段：`[bot].nickname`、`[bot].alias_names`、`[personality].personality`、`[personality].reply_style`、`[personality].behavior_style`。读不到人设时自动退回中性语气，不影响分享。
+人设通过宿主提供的 `config.get` 能力读取，字段是：`bot.nickname`、`bot.alias_names`、`personality.personality`、`personality.reply_style`、`personality.behavior_style`（也就是实例 `config/bot_config.toml` 里 `[bot]` 和 `[personality]` 两节的内容）。读不到人设时自动退回中性语气，不影响分享。
 
 > 人设只影响「怎么说」，不影响「分享什么」：筛选与打分仍由 `[interest]` / `[scoring]` 决定。
 
@@ -278,6 +290,8 @@ min_play = 1000
 | `reply_enabled` | `true` | 重发后是否回一句确认（如「好，再发一遍～」） |
 
 同时命中「触发词 + 指代词」才会触发，避免误判；重发时**直接复用当时存下的介绍文案和推荐语**，不会重新生成。
+
+> 重发**只对白名单会话（`[[streams]]`）生效**：其它群/私聊里说「再发一遍」不会触发，避免插件变成任意群都能指挥的转发器。
 
 ### `[shiwei]` 赤石视频
 
@@ -377,14 +391,14 @@ min_play = 1000
 
 ## 测试与自检
 
-单元测试（103 个用例，不需要联网）：
+单元测试（116 个用例，不需要联网）：
 
 ```powershell
 # 用 MaiBot 所在环境的 python
 & "<MaiBot>\.onekey\environments\<env>\python.exe" -X utf8 -m unittest discover -s tests
 ```
 
-覆盖：兴趣提取与打分、B 站客户端（httpx.MockTransport）、弹幕/评论解析与鱼灾过滤、抽帧帧选择、LLM 判断降级、**人设读取与提示词注入**、插件完整轮次、去重、冷却、重发、赤石、指令、以及**用宿主真实 ManifestValidator 与 PluginLoader 校验打包**。
+覆盖：兴趣提取与打分、B 站客户端（httpx.MockTransport）、弹幕/评论解析与鱼灾过滤、抽帧帧选择、LLM 判断降级、**人设读取与提示词注入**、插件完整轮次、去重、冷却、重发（含白名单约束）、赤石、指令、**下载地址与 bvid 安全校验**、以及**用宿主真实 ManifestValidator 与 PluginLoader 校验打包**。
 
 真实联网自检：
 
@@ -408,16 +422,18 @@ python tools/probe_vision.py --save ..\bili-frames
 python tools/probe_persona.py --data-dir "<MaiBot>\data\plugins\github.TommyAAKK.bilibili_interest_share"
 ```
 
+> `probe_persona.py` 是开发自检脚本，直接解析实例里的 `config/bot_config.toml` 来模拟宿主的 `config.get` 返回值；插件运行时并不直接读文件。
+
 ---
 
 ## 已知限制
 
 - **只用公开接口**，不需要登录；但 B 站有风控，请求过密可能返回 `-352`，插件会自动重试一次（重新取 WBI 密钥）后放弃本轮。
 - **排行榜接口**风控较严，未配 cookie 时基本拿不到数据，所以默认关闭。
-- **抽帧依赖 ffmpeg**：找不到 ffmpeg 时自动跳过识图，其余流程正常。
+- **抽帧依赖 ffmpeg**：优先用 `[advanced].ffmpeg_path`，其次 `imageio-ffmpeg`，最后查 `PATH`；都没有时自动跳过识图，其余流程正常。
 - **识图需要支持视觉的模型**：默认 `vlm` 任务；如果你的 `model_config.toml` 里没有这个任务，请把 `[vision].task_name` 改成任意支持图片的模型任务名，或关掉 `[vision].enabled`。
 - **LLM 判断有成本**：`llm_max_candidates` 控制每轮最多判断几个，默认 5。
 - **字幕**不是每个视频都有，没有就只用标题/简介/弹幕/评论/画面。
-- **人设依赖宿主配置**：从 `<实例>/config/bot_config.toml` 读取；若插件数据目录不在标准位置，用 `[persona].bot_config_path` 指定。读不到时退回中性语气，不影响分享。
+- **人设依赖宿主配置**：通过宿主 `config.get` 能力读取 `bot.nickname` 等字段；读不到时退回中性语气，不影响分享。
 - 分享的是**文本卡片 + 链接**，不会把视频文件发到群里。
 - 请遵守 B 站服务条款，不要把频率调得过低（`interval_minutes` 建议 ≥ 10）。

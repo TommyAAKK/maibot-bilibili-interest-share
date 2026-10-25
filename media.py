@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,6 +24,19 @@ from typing import List, Optional
 logger = logging.getLogger("plugin.bilibili_interest_share.media")
 
 _MAX_FRAME_BYTES = 4 * 1024 * 1024
+
+# bvid 会被当成临时文件/目录名使用，必须先校验格式，避免 ``../`` 之类的
+# 路径穿越把文件写到数据目录之外。
+_BVID_RE = re.compile(r"^BV[0-9A-Za-z]{1,32}$")
+
+
+def safe_bvid(value: object, *, default: str = "video") -> str:
+    """校验 bvid，合法就返回它，否则返回 ``default``。"""
+
+    text = str(value or "").strip()
+    if _BVID_RE.match(text):
+        return text
+    return default
 
 
 def resolve_ffmpeg(configured: str = "") -> str:
@@ -160,7 +174,7 @@ class FrameExtractor:
 
         work_dir = Path(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
-        target = work_dir / f"{getattr(video, 'bvid', 'video')}.mp4"
+        target = work_dir / f"{safe_bvid(getattr(video, 'bvid', ''))}.mp4"
         try:
             url = await fetch_playurl(video)
             if not url:

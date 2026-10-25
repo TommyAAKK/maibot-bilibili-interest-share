@@ -2,9 +2,12 @@
 
 确保「每个配置项都有中文备注」这件事不会随时间退化：
 
-1. ``config.toml`` 里每个键上方都有一行紧邻的中文注释；
-2. ``config.toml`` 里的每个键都在 ``README.md`` 的配置说明里有说明；
-3. ``config.py`` 里每个配置字段都有中文 ``description``。
+1. ``config.example.toml``（随仓库发布的参考模板）里每个键上方都有一行紧邻的中文注释；
+2. 模板里的每个键都在 ``README.md`` 的配置说明里有说明；
+3. ``config.py`` 里每个配置字段都有中文 ``description``；
+4. 模板里的值与 ``config.py`` 的默认值完全一致（发布副本必须还原初始设定）。
+
+运行时真正生效的 ``config.toml`` 由 MaiBot 按插件 schema 生成，不进仓库。
 """
 
 from __future__ import annotations
@@ -21,8 +24,22 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 import config as config_module  # noqa: E402
 
-CONFIG_PATH = PLUGIN_ROOT / "config.toml"
+CONFIG_PATH = PLUGIN_ROOT / "config.example.toml"
 README_PATH = PLUGIN_ROOT / "README.md"
+
+# [[streams]] 在模板里是注释掉的示例（默认没有白名单会话），
+# 所以单独校验它的字段有没有在 README 里说明。
+STREAM_KEYS = [
+    "name",
+    "enabled",
+    "stream_id",
+    "group_id",
+    "user_id",
+    "interests",
+    "categories",
+    "auto_interest",
+    "max_share_per_round",
+]
 
 _CN_RE = re.compile(r"[\u4e00-\u9fff]")
 _KEY_RE = re.compile(r"^\s*([A-Za-z0-9_\-]+)\s*=")
@@ -62,8 +79,8 @@ def _flatten_keys(data, prefix: str = "") -> list[str]:
     return keys
 
 
-class ConfigTomlCommentTests(unittest.TestCase):
-    """config.toml 的每个键都必须有一行中文注释。"""
+class ConfigTemplateCommentTests(unittest.TestCase):
+    """config.example.toml 的每个键都必须有一行中文注释。"""
 
     def test_every_key_has_adjacent_chinese_comment(self):
         lines = _read_config_lines()
@@ -75,35 +92,54 @@ class ConfigTomlCommentTests(unittest.TestCase):
                 missing.append(f"[{section}] {key} (line {line_no}) 注释不是中文：{previous}")
         self.assertEqual(missing, [], "\n".join(missing))
 
-    def test_config_toml_has_no_bom(self):
+    def test_template_has_no_bom(self):
         raw = CONFIG_PATH.read_bytes()
-        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "config.toml 不能带 BOM")
-        self.assertEqual(raw[0], ord("#"), "config.toml 应以注释开头")
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "模板文件不能带 BOM")
+        self.assertEqual(raw[0], ord("#"), "模板文件应以注释开头")
 
-    def test_config_toml_parses(self):
+    def test_template_parses(self):
         data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        self.assertIn("streams", data)
         self.assertIn("schedule", data)
+        self.assertNotIn("streams", data)  # 模板里 [[streams]] 是注释掉的示例
+
+
+class ConfigTemplateMatchesDefaultsTests(unittest.TestCase):
+    """模板里的值必须与 config.py 的默认值完全一致。"""
+
+    def test_values_equal_model_defaults(self):
+        data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        template = config_module.BilibiliInterestShareConfig(**data).model_dump(
+            mode="json"
+        )
+        defaults = config_module.BilibiliInterestShareConfig().model_dump(mode="json")
+        self.assertEqual(template, defaults)
 
 
 class ReadmeCoverageTests(unittest.TestCase):
-    """config.toml 里的每个键都要在 README 中有说明。"""
+    """配置项都要在 README 中有说明。"""
 
     def test_every_config_key_is_documented_in_readme(self):
         data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         readme = README_PATH.read_text(encoding="utf-8")
         missing = [
-            key
-            for key in _flatten_keys(data)
-            if key.split(".")[-1] not in readme
+            key for key in _flatten_keys(data) if key.split(".")[-1] not in readme
         ]
         self.assertEqual(sorted(set(missing)), [], f"README 缺少这些配置项的说明：{missing}")
 
     def test_readme_documents_all_sections(self):
         data = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         readme = README_PATH.read_text(encoding="utf-8")
-        missing = [name for name in data if f"[{name}]" not in readme and f"[[{name}]]" not in readme]
+        missing = [
+            name
+            for name in data
+            if f"[{name}]" not in readme and f"[[{name}]]" not in readme
+        ]
         self.assertEqual(missing, [], f"README 缺少这些 section：{missing}")
+
+    def test_readme_documents_stream_keys(self):
+        readme = README_PATH.read_text(encoding="utf-8")
+        missing = [key for key in STREAM_KEYS if key not in readme]
+        self.assertEqual(missing, [], f"README 缺少 [[streams]] 这些字段的说明：{missing}")
 
 
 class ConfigFieldDescriptionTests(unittest.TestCase):
@@ -134,7 +170,9 @@ class ConfigFieldDescriptionTests(unittest.TestCase):
                 if not description:
                     missing.append(f"{model.__name__}.{name} 缺少 description")
                 elif not _CN_RE.search(description):
-                    missing.append(f"{model.__name__}.{name} description 不是中文：{description}")
+                    missing.append(
+                        f"{model.__name__}.{name} description 不是中文：{description}"
+                    )
         self.assertEqual(missing, [], "\n".join(missing))
 
 

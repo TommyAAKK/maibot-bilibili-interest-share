@@ -64,7 +64,7 @@ def base_config(**overrides):
     """返回一份“一定会分享”的测试配置（默认关闭 LLM/抽帧/弹幕，保证确定性）。"""
 
     config = {
-        "plugin": {"enabled": True, "config_version": "1.0.0"},
+        "plugin": {"enabled": True, "config_version": "1.0.1"},
         "schedule": {
             "interval_minutes": 30,
             "jitter_seconds": 0,
@@ -256,12 +256,11 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         persona_module = load_submodule("persona")
         plugin._persona = persona_module.PersonaProvider(
             enabled=config.persona.enabled,
-            data_dir=self.tmp_dir,
+            config_get=ctx.config.get,
             override_name=config.persona.name,
             override_personality=config.persona.personality,
             override_reply_style=config.persona.reply_style,
             style_hint=config.persona.style_hint,
-            config_path=config.persona.bot_config_path,
             cache_seconds=config.persona.cache_seconds,
         )
         plugin._judge = self.module.LlmJudge(
@@ -650,26 +649,19 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("小鲸鱼", prompt)
         self.assertIn("虚拟鲸鱼", prompt)
 
-    async def test_persona_read_from_host_bot_config(self) -> None:
-        root = self.tmp_dir / "MaiBot"
-        data_dir = root / "data" / "plugins" / PLUGIN_ID
-        data_dir.mkdir(parents=True)
-        config_dir = root / "config"
-        config_dir.mkdir(parents=True)
-        (config_dir / "bot_config.toml").write_text(
-            '[bot]\nnickname = "小虎鲸"\n\n[personality]\npersonality = "爱刷 B 站"\n',
-            encoding="utf-8",
+    async def test_persona_read_from_host_config(self) -> None:
+        ctx = FakeCtx(
+            self.tmp_dir,
+            llm=FakeLlm(judge_response=JUDGE_WITH_INTRO),
+            config_values={
+                "bot.nickname": "小虎鲸",
+                "personality.personality": "爱刷 B 站",
+            },
         )
-        ctx = FakeCtx(data_dir, llm=FakeLlm(judge_response=JUDGE_WITH_INTRO))
         plugin = self.make_plugin(
             base_config(interest={"use_llm_judge": True}), ctx=ctx
         )
-        plugin._data_dir = data_dir
-        persona_module = load_submodule("persona")
-        plugin._persona = persona_module.PersonaProvider(
-            enabled=True, data_dir=data_dir, cache_seconds=0
-        )
-        plugin._judge._persona_provider = plugin._persona
+        await plugin._persona.refresh()
         text = (await plugin.cmd_status(stream_id="s"))[1]
         self.assertIn("小虎鲸", text)
         self.assertIn("宿主", text)
@@ -802,6 +794,42 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.ctx.send.messages, [])
 
+    async def test_reshare_hook_ignores_non_whitelisted_stream(self) -> None:
+        """重发只对白名单会话生效，别的群让再发一遍也不发。"""
+
+        video = make_video(self.video_module, bvid="BVR3", title="原神新版本测评")
+        plugin = self.make_plugin(base_config())
+        plugin._store.mark_shared(
+            video, narrative="缓存介绍文案", kind="auto", stream_id="other-stream"
+        )
+        await plugin.on_chat_receive(
+            "chat.receive.before_process",
+            {
+                "processed_plain_text": "之前发的原神新版本测评再发一遍",
+                "session_id": "other-stream",
+            },
+        )
+        self.assertEqual(self.ctx.send.messages, [])
+
+    async def test_reshare_hook_ignores_when_whitelist_empty(self) -> None:
+        """没有配置白名单会话时，重发功能整体不生效。"""
+
+        video = make_video(self.video_module, bvid="BVR4", title="原神新版本测评")
+        config = base_config()
+        config["streams"] = []
+        plugin = self.make_plugin(config)
+        plugin._store.mark_shared(
+            video, narrative="缓存介绍文案", kind="auto", stream_id="stream-1"
+        )
+        await plugin.on_chat_receive(
+            "chat.receive.before_process",
+            {
+                "processed_plain_text": "之前发的原神新版本测评再发一遍",
+                "session_id": "stream-1",
+            },
+        )
+        self.assertEqual(self.ctx.send.messages, [])
+
     # -- 生命周期与配置 ------------------------------------------------
 
     async def test_lifecycle_starts_and_stops_loop(self) -> None:
@@ -838,7 +866,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults["schedule"]["interval_minutes"], 60)
         self.assertEqual(defaults["schedule"]["search_cooldown_seconds"], 300)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "1.0.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "1.0.1")
         self.assertEqual(defaults["interest"]["llm_task_name"], "planner")
         self.assertEqual(defaults["vision"]["task_name"], "vlm")
         self.assertTrue(defaults["categories"])
@@ -932,15 +960,15 @@ class PackagingTest(unittest.TestCase):
             else:
                 os.environ["MAIBOT_INSTANCE_DIR"] = old_instance
 
-    def test_config_toml_matches_model(self) -> None:
+    def test_config_example_matches_model(self) -> None:
         import tomllib
 
-        with (PLUGIN_ROOT / "config.toml").open("rb") as handle:
+        with (PLUGIN_ROOT / "config.example.toml").open("rb") as handle:
             raw = tomllib.load(handle)
         plugin = load_plugin_module().BilibiliInterestSharePlugin()
         plugin.set_plugin_config(raw)  # 不应抛异常
-        self.assertEqual(plugin.config.plugin.config_version, "1.0.0")
-        self.assertTrue(plugin.config.streams)
+        self.assertEqual(plugin.config.plugin.config_version, "1.0.1")
+        self.assertEqual(plugin.config.streams, [])
         self.assertTrue(plugin.config.categories)
         self.assertEqual(plugin.config.vision.task_name, "vlm")
         self.assertEqual(plugin.config.interest.llm_task_name, "planner")

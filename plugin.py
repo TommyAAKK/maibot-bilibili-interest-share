@@ -21,7 +21,7 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from maibot_sdk import Command, HookHandler, MaiBotPlugin
 from maibot_sdk.components import HookMode
@@ -35,7 +35,7 @@ from .interest import (
     rank_videos,
 )
 from .llm_judge import LlmJudge
-from .media import FrameExtractor, cleanup_dir
+from .media import FrameExtractor, cleanup_dir, safe_bvid
 from .persona import PersonaProvider
 from .store import COOLDOWN_ACTIVE_SEARCH, COOLDOWN_SHIWEI, SeenStore
 from .textfilter import filter_comments, filter_danmaku
@@ -44,6 +44,8 @@ logger = logging.getLogger("plugin.bilibili_interest_share")
 
 PLUGIN_ID = "github.TommyAAKK.bilibili_interest_share"
 _MAX_HISTORY_ITEMS = 8
+# 白名单 stream_id 缓存时间（秒）
+_ALLOWED_STREAMS_TTL_SECONDS = 300.0
 
 
 # ----------------------------------------------------------------------
@@ -202,6 +204,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         self._judge: Optional[LlmJudge] = None
         self._persona: Optional[PersonaProvider] = None
         self._data_dir: Optional[Path] = None
+        self._allowed_stream_ids: Set[str] = set()
+        self._allowed_streams_at: float = 0.0
         self._round_lock = asyncio.Lock()
         self.last_round: Optional[Dict[str, Any]] = None
         self.last_round_at: Optional[float] = None
@@ -239,12 +243,11 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         )
         self._persona = PersonaProvider(
             enabled=config.persona.enabled,
-            data_dir=self._data_dir,
+            config_get=self._config_getter(),
             override_name=config.persona.name,
             override_personality=config.persona.personality,
             override_reply_style=config.persona.reply_style,
             style_hint=config.persona.style_hint,
-            config_path=config.persona.bot_config_path,
             cache_seconds=config.persona.cache_seconds,
         )
         self._judge = LlmJudge(
@@ -254,6 +257,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             temperature=config.interest.llm_temperature,
             persona_provider=self._persona,
         )
+        await self._persona.refresh()
+        await self._refresh_allowed_streams()
 
         self._loop_task = asyncio.create_task(
             self._run_loop(), name="bilibili-interest-share-loop"
@@ -346,6 +351,13 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return {"ok": False, "skipped": "not_loaded", "reason": reason, "fetched": 0, "shared": 0}
 
         async with self._round_lock:
+            # 每轮开始前刷新人设与白名单缓存（都带 TTL，不会频繁请求宿主）
+            if self._persona is not None:
+                try:
+                    await self._persona.ensure()
+                except Exception as exc:  # noqa: BLE001 - 人设读不到就用中性语气
+                    logger.debug("刷新人设失败：%s", exc)
+            await self._ensure_allowed_streams()
             resolved: List[Tuple[Any, str, InterestProfile]] = []
             for target in targets:
                 stream_id = await self._resolve_stream(target)
@@ -615,7 +627,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         if not self._frames.available:
             logger.debug("未找到 ffmpeg，跳过抽帧")
             return []
-        work_dir = self._data_dir / "frames" / (video.bvid or "video")
+        work_dir = self._data_dir / "frames" / safe_bvid(getattr(video, "bvid", ""))
         try:
             frames = await self._frames.capture(self._client, video, work_dir)
         except asyncio.CancelledError:
@@ -725,6 +737,41 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         return False
 
     # -- 兴趣与关键词 --------------------------------------------------
+
+    def _config_getter(self):
+        """拿到宿主的 ``config.get`` 能力（拿不到时返回 None）。"""
+
+        config_cap = getattr(self.ctx, "config", None)
+        getter = getattr(config_cap, "get", None)
+        return getter if callable(getter) else None
+
+    async def _refresh_allowed_streams(self) -> Set[str]:
+        """解析白名单里所有启用的会话，缓存可用的 stream_id 集合。
+
+        重发（reshare）等被动触发的发送只允许落在白名单会话里，
+        这个集合就是判断依据。
+        """
+
+        config = self.config
+        allowed: Set[str] = set()
+        for target in config.streams or []:
+            if not getattr(target, "enabled", False):
+                continue
+            stream_id = await self._resolve_stream(target)
+            if stream_id:
+                allowed.add(stream_id)
+        self._allowed_stream_ids = allowed
+        self._allowed_streams_at = time.time()
+        return allowed
+
+    async def _ensure_allowed_streams(self) -> Set[str]:
+        """白名单集合为空或过期时重新解析。"""
+
+        if self._allowed_stream_ids and (
+            time.time() - self._allowed_streams_at
+        ) < _ALLOWED_STREAMS_TTL_SECONDS:
+            return self._allowed_stream_ids
+        return await self._refresh_allowed_streams()
 
     async def _resolve_stream(self, target: Any) -> str:
         """把白名单配置解析成真实的 stream_id。"""
@@ -1072,6 +1119,12 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         stream_id = _stream_id_of(message)
         if not stream_id:
             return
+        # 只在白名单会话里重发：这个 Hook 是聊天消息触发的被动发送，
+        # 必须确认当前会话确实是配置里启用的白名单会话。
+        allowed = await self._ensure_allowed_streams()
+        if stream_id not in allowed:
+            logger.debug("会话 %s 不在白名单，忽略重发请求", stream_id)
+            return
         matches = self._store.find_by_query(
             text,
             limit=1,
@@ -1231,7 +1284,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return ""
         if persona.is_empty:
             return "人设语气：未读到人设（分享文案用中性语气）"
-        source = "手动配置" if persona.source == "override" else "宿主 bot_config.toml"
+        source = "手动配置" if persona.source == "override" else "宿主配置"
         name = persona.name or "（未命名）"
         return f"人设语气：{name}（来自{source}）"
 

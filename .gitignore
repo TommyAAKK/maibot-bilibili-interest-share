@@ -1,4 +1,7 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 logs/
 .pytest_cache/
+
+# 运行时配置由 MaiBot 按插件 schema 生成，不进仓库（参考模板见 config.example.toml）
+/config.toml

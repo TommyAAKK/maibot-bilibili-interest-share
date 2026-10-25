@@ -33,7 +33,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用麦麦刷B站")
-    config_version: str = Field(default="1.0.0", description="配置版本（由插件维护）")
+    config_version: str = Field(default="1.0.1", description="配置版本（由插件维护）")
 
 
 class ScheduleConfig(PluginConfigBase):
@@ -300,7 +300,7 @@ class PersonaConfig(PluginConfigBase):
 
     enabled: bool = Field(
         default=True,
-        description="分享文案是否使用 MaiBot 配置的人设语气（读取宿主 config/bot_config.toml）",
+        description="分享文案是否使用 MaiBot 配置的人设语气（通过 config.get 能力读取宿主配置）",
     )
     name: str = Field(default="", description="覆盖人设名字；留空自动读取宿主的 nickname")
     personality: str = Field(
@@ -312,10 +312,6 @@ class PersonaConfig(PluginConfigBase):
     style_hint: str = Field(
         default="",
         description="额外的风格要求，会追加到人设后面，如「分享时不要太啰嗦，最多两句话」",
-    )
-    bot_config_path: str = Field(
-        default="",
-        description="手动指定 bot_config.toml 路径；留空则按插件数据目录反推实例根目录",
     )
     cache_seconds: int = Field(
         default=120, ge=0, le=3600, description="人设缓存秒数；宿主改人设后最多这么久生效"

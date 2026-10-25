@@ -143,6 +143,18 @@ class FakeLlm:
         return {"success": True, "response": text, "model": f"mock-{task_name}"}
 
 
+class FakeConfig:
+    """假的 config.get 能力：从扁平字典按 key 取值。"""
+
+    def __init__(self, values: Optional[Dict[str, Any]] = None) -> None:
+        self.values: Dict[str, Any] = dict(values or {})
+        self.calls: List[str] = []
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        self.calls.append(key)
+        return self.values.get(key, default)
+
+
 class FakeCtx:
     def __init__(
         self,
@@ -152,6 +164,7 @@ class FakeCtx:
         group_streams: Optional[Dict[str, Dict[str, Any]]] = None,
         user_streams: Optional[Dict[str, Dict[str, Any]]] = None,
         llm: Optional[FakeLlm] = None,
+        config_values: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.paths = FakePaths(data_dir)
         self.logger = FakeLogger()
@@ -159,6 +172,7 @@ class FakeCtx:
         self.chat = FakeChat(group_streams=group_streams, user_streams=user_streams)
         self.message = FakeMessage(messages)
         self.llm = llm if llm is not None else FakeLlm()
+        self.config = FakeConfig(config_values)
 
 
 class FakeClient:
