@@ -242,7 +242,9 @@ class CommandDocTests(unittest.TestCase):
 class ChangelogTests(unittest.TestCase):
     """版本迭代必须同步更新 CHANGELOG.md 与 README 的版本号。"""
 
-    VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
+    # 只认带 v 前缀的版本号（如 v1.0.3）；README 里也会出现依赖版本（如 imageio-ffmpeg 0.4.9），
+    # 那种不该被当成插件版本去要求 CHANGELOG 里有对应小节。
+    VERSION_RE = re.compile(r"\bv(\d+\.\d+\.\d+)\b")
     HEADING_RE = re.compile(r"^##\s*\[(\d+\.\d+\.\d+)\]", re.MULTILINE)
 
     @classmethod

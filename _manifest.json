@@ -21,7 +21,13 @@
     "min_version": "2.9.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "imageio-ffmpeg",
+      "version_spec": ">=0.4.9"
+    }
+  ],
   "capabilities": [
     "send.text",
     "chat.get_stream_by_group_id",

@@ -544,8 +544,36 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
 
         config = self.config
         limit = max(1, int(limit))
+        # 每个类别可以有自己的每轮分享上限（0 = 不单独限制）
+        category_caps = {
+            str(category.name): int(category.max_share_per_round)
+            for category in config.categories
+            if category.name and int(category.max_share_per_round or 0) > 0
+        }
+        per_category: Dict[str, int] = {}
+
+        def _over_category_cap(result: ScoreResult) -> bool:
+            name = str(result.category or "")
+            cap = category_caps.get(name)
+            if not cap:
+                return False
+            return per_category.get(name, 0) >= cap
+
+        def _count_category(result: ScoreResult) -> None:
+            name = str(result.category or "")
+            if name in category_caps:
+                per_category[name] = per_category.get(name, 0) + 1
+
         if not config.interest.use_llm_judge or self._judge is None or not self._judge.available:
-            return [(result, None) for result in results[:limit]]
+            simple: List[Tuple[ScoreResult, Optional[Dict[str, Any]]]] = []
+            for result in results:
+                if _over_category_cap(result):
+                    continue
+                simple.append((result, None))
+                _count_category(result)
+                if len(simple) >= limit:
+                    break
+            return simple
 
         interests = [term for term, _weight in profile.sorted_terms()[:10]]
         max_check = max(limit, int(config.interest.llm_max_candidates or 0), 1)
@@ -597,7 +625,10 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                         if refined is not None:
                             judged = refined
 
+            if _over_category_cap(result):
+                continue
             picked.append((result, judged))
+            _count_category(result)
             if len(picked) >= limit:
                 break
         return picked
@@ -987,6 +1018,11 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return {"ok": False, "reason": "disabled"}
         if self._client is None or self._store is None:
             return {"ok": False, "reason": "not_loaded"}
+        # 主动搜索也只在白名单会话里生效，避免任意群里一条指令就把视频发过去
+        allowed = await self._ensure_allowed_streams()
+        if stream_id not in allowed:
+            logger.debug("会话 %s 不在白名单，忽略主动搜索请求", stream_id)
+            return {"ok": False, "reason": "not_allowed"}
 
         remaining = self._store.cooldown_remaining(
             COOLDOWN_ACTIVE_SEARCH, config.schedule.search_cooldown_seconds
@@ -1098,6 +1134,11 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return {"ok": False, "reason": "disabled"}
         if self._client is None or self._store is None:
             return {"ok": False, "reason": "not_loaded"}
+        # 赤石视频同样只发给白名单会话
+        allowed = await self._ensure_allowed_streams()
+        if stream_id not in allowed:
+            logger.debug("会话 %s 不在白名单，忽略赤石视频请求", stream_id)
+            return {"ok": False, "reason": "not_allowed"}
 
         remaining = self._store.cooldown_remaining(COOLDOWN_SHIWEI, config.shiwei.cooldown_seconds)
         if remaining > 0:
@@ -1118,11 +1159,18 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return {"ok": False, "reason": "no_candidates"}
 
         blocked = [item.lower() for item in config.shiwei.block_keywords or []]
+        # 赤石路径也套一层全局屏蔽词，避免把广告/带货/官方预告当整活发出去
+        blocked.extend(item.lower() for item in config.filter.block_keywords or [])
+        if config.filter.exclude_official:
+            blocked.extend(item.lower() for item in config.filter.official_keywords or [])
+        blocked_up = [item.lower() for item in config.filter.block_up_names or []]
         shiwei_words = [item for item in config.shiwei.keywords if item]
         scored: List[Tuple[float, Video]] = []
         for video in merge_videos([videos]):
             haystack = f"{video.title} {video.description} {getattr(video, 'tags', '')}".lower()
             if any(token and token in haystack for token in blocked):
+                continue
+            if blocked_up and any(name and name in str(getattr(video, "owner", "")).lower() for name in blocked_up):
                 continue
             if video.play < config.shiwei.min_play:
                 continue
@@ -1266,6 +1314,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         result = await self.search_and_share(query, stream_id)
         if result.get("ok"):
             text = f"已搜索并分享：{query}（{len(result.get('shared') or [])} 个）"
+        elif result.get("reason") == "not_allowed":
+            text = "这个会话不在插件白名单里，换一个配置里列出的群再试吧"
         elif result.get("reason") == "cooldown":
             text = f"主动搜索还在冷却中，请 {int(result.get('remaining') or 0)} 秒后再试"
         else:
@@ -1284,6 +1334,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         result = await self.share_shiwei(stream_id)
         if result.get("ok"):
             text = "赤石视频已送达。"
+        elif result.get("reason") == "not_allowed":
+            text = "这个会话不在插件白名单里，换一个配置里列出的群再试吧"
         elif result.get("reason") == "cooldown":
             text = f"赤石视频还在冷却中，请 {int(result.get('remaining') or 0)} 秒后再试"
         else:
@@ -1302,8 +1354,16 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 return value.strip()
         for key in ("query", "text", "raw_message"):
             value = kwargs.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+            if not isinstance(value, str) or not value.strip():
+                continue
+            value = value.strip()
+            if value.startswith("/"):
+                # 没匹配到参数时会回退到整条指令原文，把指令本身剥掉，别拿「/bili-search」当搜索词
+                parts = value.split(None, 1)
+                value = parts[1].strip() if len(parts) > 1 else ""
+                if not value:
+                    continue
+            return value
         return ""
 
     def _format_summary(self, summary: Dict[str, Any]) -> str:

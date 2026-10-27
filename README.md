@@ -20,9 +20,9 @@
 | 深度理解 | CC 字幕 + 弹幕 + 热门评论 + **抽帧识图** + LLM 语义判断与自然语言介绍 |
 | 噪声过滤 | 硬过滤（时长/播放/点赞/屏蔽词/官方内容）+ AI 鱼灾式模板弹幕评论过滤 |
 | 去重 | 分享过的视频记入名单，默认 30 天内不再自动分享 |
-| 主动搜索 | `/bili-search 关键词`，独立冷却（默认 5 分钟），不影响自动频率 |
+| 主动搜索 | `/bili-search 关键词`，独立冷却（默认 5 分钟），不影响自动频率；同样只在白名单会话里生效 |
 | 自然语言重发 | 聊天里说「你之前发的那个 XX 再发一遍」，插件从历史记录里找回并**复用当时的介绍文案**重发 |
-| 赤石视频 | `/赤石视频` 抓一个抽象整活类视频，**只发标题+链接，不带介绍** |
+| 赤石视频 | `/赤石视频` 抓一个抽象整活类视频，**只发标题+链接，不带介绍**；也走白名单和全局屏蔽词 |
 | 人设语气 | 推荐语和介绍文案按 MaiBot 的**麦麦人设**口吻生成（通过 `config.get` 能力读宿主配置），可覆盖、可关 |
 | 可观测 | `/bili-status` 看状态、`/bili-test` 预览本轮打分（只预览，不分享视频） |
 
@@ -80,9 +80,11 @@ github.TommyAAKK.bilibili_interest_share/
 
    > 仓库里的 `config.example.toml` 是同一份配置的**带中文注释版模板**：想直接看注释版，把它复制成 `config.toml` 即可（值完全一致）。自动生成的 `config.toml` 不含注释，但 WebUI 表单里每一项都有中文说明。
 
-插件**不依赖额外 pip 包**：HTTP 用宿主自带的 `httpx`。
+插件**运行时不依赖额外 pip 包**：HTTP 用宿主自带的 `httpx`。
 
-**抽帧识图需要 ffmpeg**（可选功能）：优先用 `[advanced].ffmpeg_path`，其次找 `imageio-ffmpeg`（MaiBot 环境里通常已装），最后查系统 `PATH`。三者都没有时会自动跳过抽帧，其余流程正常。如果希望开箱即用，请确认运行 MaiBot 的环境里 `PATH` 有 `ffmpeg`，或装了 `imageio-ffmpeg`。
+**抽帧识图需要 ffmpeg**（可选功能）：优先用 `[advanced].ffmpeg_path`，其次找 `imageio-ffmpeg`，最后查系统 `PATH`。三者都没有时会自动跳过抽帧，其余流程正常。
+
+`_manifest.json` 里把 `imageio-ffmpeg` 声明成了 `python_package` 依赖（`>=0.4.9`）：MaiBot 安装插件时会先检查环境里有没有，缺了才会自动装（装了它等于自带一份 ffmpeg，抽帧开箱即用）。如果你在完全离线的环境里部署、又不想让它去装包，可以手动 `pip install imageio-ffmpeg` 或直接在系统 `PATH` 里放一个 `ffmpeg`，宿主检测到已满足就不会再联网。
 
 ---
 
@@ -145,7 +147,7 @@ min_play = 1000
 | `enabled` | `true` | 是否启用这个类别 |
 | `keywords` | — | 这个类别用来搜索的关键词 |
 | `search_order` | `""` | 该类别搜索排序；留空用 `[sources].search_order`，`pubdate` = 按最新发布 |
-| `max_share_per_round` | `0` | 该类别每轮最多几个，`0` = 不单独限制 |
+| `max_share_per_round` | `0` | 该类别每轮最多几个，`0` = 不单独限制（和 `[schedule].max_share_per_round`、`[[streams]].max_share_per_round` 一起取最严的那个） |
 | `min_play` | `0` | 该类别的最低播放量，`0` = 沿用 `[filter].min_play` |
 
 - 聊天流可用 `[[streams]].categories` 指定只启用其中几类
@@ -308,6 +310,10 @@ min_play = 1000
 
 `/赤石视频` 只发「【标题】链接」，**不带介绍文案**，也不影响普通分享的去重与冷却。
 
+> 这条路径也会过一遍 `[filter]` 的全局过滤：`block_keywords`、`block_up_names`，以及 `exclude_official` 打开时的 `official_keywords`——搜索词虽然宽（离谱/逆天/翻车），但广告、带货、官方预告这类内容会被挡掉。
+>
+> 和重发一样，`/赤石视频` **只对白名单会话（`[[streams]]`）生效**，其它群发指令不会把视频发过去。
+
 ### `[advanced]` 运行参数
 
 | 键 | 默认 | 说明 |
@@ -344,8 +350,8 @@ min_play = 1000
 | `/bili-share` | `/b站分享` | 立即跑一轮（无视自动频率，仍受活跃时段限制） |
 | `/bili-status` | — | 查看启用状态、频率、白名单数量、下一轮时间、记录统计 |
 | `/bili-test` | — | 预览本轮候选与前 5 名打分，只把预览结果发回当前会话，**不分享视频** |
-| `/bili-search 关键词` | `/b站搜索` | 主动搜索并分享，受 `search_cooldown_seconds` 冷却 |
-| `/赤石视频` | — | 抓一个抽象整活视频，只发标题+链接 |
+| `/bili-search 关键词` | `/b站搜索` | 主动搜索并分享，受 `search_cooldown_seconds` 冷却；**只在白名单会话里生效** |
+| `/赤石视频` | — | 抓一个抽象整活视频，只发标题+链接；**只在白名单会话里生效** |
 
 ---
 
@@ -390,14 +396,14 @@ min_play = 1000
 
 ## 测试与自检
 
-单元测试（132 个用例，不需要联网）：
+单元测试（143 个用例，不需要联网）：
 
 ```powershell
 # 用 MaiBot 所在环境的 python
 & "<MaiBot>\.onekey\environments\<env>\python.exe" -X utf8 -m unittest discover -s tests
 ```
 
-覆盖：兴趣提取与打分、B 站客户端（httpx.MockTransport）、弹幕/评论解析与鱼灾过滤、抽帧帧选择、LLM 判断降级、**人设读取与提示词注入**、插件完整轮次、去重、冷却、重发（含白名单约束）、赤石、指令、**下载地址与 bvid 安全校验**、以及**用宿主真实 ManifestValidator 与 PluginLoader 校验打包**。
+覆盖：兴趣提取与打分、B 站客户端（httpx.MockTransport）、弹幕/评论解析与鱼灾过滤、抽帧帧选择、LLM 判断降级、**人设读取与提示词注入**、插件完整轮次、去重、冷却、重发（含白名单约束）、赤石（含全局屏蔽词）、指令（含白名单与参数解析）、**类别级每轮上限**、**下载地址与 bvid 安全校验**、以及**用宿主真实 ManifestValidator 与 PluginLoader 校验打包**。
 
 真实联网自检：
 

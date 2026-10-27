@@ -23,6 +23,14 @@
 ### 修复
 
 - 兼容新版宿主的 `send.text` 返回结构：宿主 1.3.15 / SDK 2.16 在 `return_details=False` 时返回 `{"success": bool}`，而旧代码只认 `{"sent": bool}`，会把「发成功」误判成「发失败」。现在两种结构都识别，真失败时把宿主给的 `error` 写进日志。
+- `[[categories]].max_share_per_round` 真正生效（之前只取 `[schedule]` 和 `[[streams]]` 的值，类别级上限形同虚设，是第四个「文档里写了、代码没读」的配置项）。
+- `/bili-search` 和 `/赤石视频` 现在也受 `[[streams]]` 白名单约束：之前任意群里一条指令就能把视频发到那个群，与 README「只有白名单聊天流会收到分享」的说法不符；现在非白名单会话会回一句提示，不发视频。
+- 赤石视频路径补上全局过滤：`[filter].block_keywords`、`[filter].block_up_names`，以及 `exclude_official` 打开时的 `official_keywords` 都会生效，避免广告/带货/官方预告被当成整活发出去。
+- `/bili-search` 不带参数时不再拿指令原文当搜索词：之前 `_command_arg` 会一路回退到 `raw_message`，等于用「/bili-search」去搜 B 站；现在会剥掉指令前缀，剥完为空就回「用法」。
+
+### 依赖
+
+- `_manifest.json` 的 `dependencies` 里声明 `imageio-ffmpeg >= 0.4.9`（`python_package`）：抽帧用的 ffmpeg 由它提供，宿主安装插件时会先检查、缺了才自动装；已装或系统 `PATH` 有 `ffmpeg` 时不会重复安装。
 
 ### 兼容
 
