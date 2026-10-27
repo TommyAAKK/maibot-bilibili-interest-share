@@ -5,6 +5,14 @@
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 `_manifest.json` 的 `version` 与 `config.py` 里的 `config_version` 始终一致。
 
+## [1.1.1] - 2026-10-27
+
+只改插件清单（`_manifest.json`），代码逻辑没有变化。v1.1.0 因清单里的 SDK 版本区间不合规没能通过市场校验，这里修正后重新发布。
+
+### 修复
+
+- `_manifest.json` 的 `sdk.max_version` 从 `2.99.99` 改成 `2.16.99`：市场校验要求版本号第一位和第二位不能填 `99` / `999`（第三位不受限制），`2.99.99` 会被判为「请填写实际版本」而验证失败。`2.16.99` 对应 `maibot-plugin-sdk` 目前的最新实际版本 2.16.x。
+
 ## [1.1.0] - 2026-10-27
 
 分享改成「随口一提」，不再摆出明确的分享/推荐意图。
