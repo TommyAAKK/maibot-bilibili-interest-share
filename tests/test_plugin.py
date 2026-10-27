@@ -1149,6 +1149,56 @@ class RecentMessagesSdkSignatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages, [])
 
 
+class _SendStub:
+    """返回指定结果的假 send 能力，用来覆盖宿主不同版本的返回结构。"""
+
+    def __init__(self, result) -> None:
+        self.result = result
+        self.calls = []
+
+    async def text(self, text: str, stream_id: str, **kwargs):
+        self.calls.append({"text": text, "stream_id": stream_id})
+        return self.result
+
+
+class SendResultShapeTests(unittest.IsolatedAsyncioTestCase):
+    """宿主 1.3.15 的 send.text 返回 {"success": bool}，旧版返回 {"sent": bool}。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_dir = Path(self._tmp.name)
+        self.module = load_plugin_module()
+
+    def _make_plugin(self, send_result):
+        ctx = FakeCtx(self.tmp_dir)
+        ctx.send = _SendStub(send_result)
+        plugin = self.module.BilibiliInterestSharePlugin()
+        plugin._set_context(ctx)
+        plugin.set_plugin_config(base_config())
+        plugin._data_dir = self.tmp_dir
+        return plugin, ctx
+
+    async def test_success_key_means_sent(self) -> None:
+        plugin, ctx = self._make_plugin({"success": True})
+        self.assertTrue(await plugin._send_text("stream-1", "随便说一句"))
+        self.assertEqual(len(ctx.send.calls), 1)
+
+    async def test_sent_key_still_works(self) -> None:
+        plugin, _ctx = self._make_plugin({"sent": True, "message_id": "123"})
+        self.assertTrue(await plugin._send_text("stream-1", "随便说一句"))
+
+    async def test_success_false_is_failure(self) -> None:
+        plugin, _ctx = self._make_plugin({"success": False, "error": "没权限"})
+        self.assertFalse(await plugin._send_text("stream-1", "随便说一句"))
+
+    async def test_plain_bool_results(self) -> None:
+        plugin, _ctx = self._make_plugin(True)
+        self.assertTrue(await plugin._send_text("stream-1", "随便说一句"))
+        plugin, _ctx = self._make_plugin(False)
+        self.assertFalse(await plugin._send_text("stream-1", "随便说一句"))
+
+
 class ConfigFieldBehaviorTests(unittest.IsolatedAsyncioTestCase):
     """几个「配置项写了就得真生效」的行为，防止 schema 与实现对不上。"""
 

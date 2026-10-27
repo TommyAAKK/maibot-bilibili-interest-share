@@ -902,7 +902,19 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             logger.warning("发送消息失败（%s）：%s", stream_id, exc)
             return False
         if isinstance(result, dict):
-            return bool(result.get("sent"))
+            # 不同宿主版本的返回结构不同：
+            # - 宿主 1.3.15 / SDK 2.16（return_details=False）：{"success": bool}
+            # - 旧版或 return_details=True：{"sent": bool, "message_id": ...}
+            if "sent" in result:
+                return bool(result.get("sent"))
+            if "success" in result:
+                if not result.get("success"):
+                    logger.warning(
+                        "发送消息失败（%s）：%s", stream_id, result.get("error") or result
+                    )
+                    return False
+                return True
+            return True
         return bool(result)
 
     async def _send_parts(

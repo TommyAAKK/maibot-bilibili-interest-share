@@ -20,6 +20,10 @@
 - 「随口一提」模式下不再单独发推荐语，也不再分条发送；`send_as_parts` / `intro_enabled` / `narrative_enabled` 只在关闭该模式后生效。
 - 没有 LLM 可用时的兜底文案，在「随口一提」模式下按 `casual_max_chars` 截断，避免把长简介整段贴出来。
 
+### 修复
+
+- 兼容新版宿主的 `send.text` 返回结构：宿主 1.3.15 / SDK 2.16 在 `return_details=False` 时返回 `{"success": bool}`，而旧代码只认 `{"sent": bool}`，会把「发成功」误判成「发失败」。现在两种结构都识别，真失败时把宿主给的 `error` 写进日志。
+
 ### 兼容
 
 - 关闭 `casual_mode` 即回到 v1.0.x 的「推荐语 / 标题链接 / 自然语言介绍」分条格式，行为与配置含义都不变。
