@@ -64,7 +64,7 @@ def base_config(**overrides):
     """返回一份“一定会分享”的测试配置（默认关闭 LLM/抽帧/弹幕，保证确定性）。"""
 
     config = {
-        "plugin": {"enabled": True, "config_version": "1.0.3"},
+        "plugin": {"enabled": True, "config_version": "1.1.0"},
         "schedule": {
             "interval_minutes": 30,
             "jitter_seconds": 0,
@@ -133,6 +133,8 @@ def base_config(**overrides):
             "require_interest_match": True,
         },
         "share": {
+            "casual_mode": False,
+            "casual_max_chars": 60,
             "send_as_parts": False,
             "part_delay_seconds": 0.0,
             "narrative_enabled": True,
@@ -629,6 +631,72 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("呜哇，这个好好看！", texts)
         self.assertIn("【原神新版本测评】", texts[0])
 
+    # -- 随口一提模式 --------------------------------------------------
+
+    async def test_casual_mode_sends_single_message(self) -> None:
+        ctx = FakeCtx(self.tmp_dir, llm=FakeLlm(judge_response=JUDGE_WITH_INTRO))
+        plugin = self.make_plugin(
+            base_config(
+                share={"casual_mode": True, "intro_enabled": True},
+                interest={"use_llm_judge": True},
+            ),
+            ctx=ctx,
+        )
+        summary = await plugin.run_round(reason="test")
+        self.assertTrue(summary["ok"], summary)
+        self.assertEqual(len(ctx.send.messages), 1)
+        text = ctx.send.messages[0]["text"]
+        self.assertIn("这期把新版本的内容聊得挺透", text)
+        self.assertIn("【原神新版本测评】", text)
+        self.assertIn("https://www.bilibili.com/video/BV1", text)
+        # 随口一提模式不再单独发推荐语
+        self.assertNotIn("呜哇，这个好好看！", text)
+
+    async def test_casual_prompt_asks_for_offhand_tone(self) -> None:
+        ctx = FakeCtx(self.tmp_dir, llm=FakeLlm(judge_response=JUDGE_WITH_INTRO))
+        plugin = self.make_plugin(
+            base_config(
+                share={"casual_mode": True, "casual_max_chars": 50},
+                interest={"use_llm_judge": True},
+            ),
+            ctx=ctx,
+        )
+        await plugin.run_round(reason="test")
+        prompt = ctx.llm.calls[0]["prompt"]
+        self.assertIn("随口", prompt)
+        self.assertIn("不要用「推荐」「分享」「安利」", prompt)
+        self.assertIn("50 字", prompt)
+        # 随口一提模式不再要求单独生成推荐语字段
+        self.assertNotIn('"intro"', prompt)
+
+    async def test_standard_prompt_keeps_intro_field(self) -> None:
+        ctx = FakeCtx(self.tmp_dir, llm=FakeLlm(judge_response=JUDGE_WITH_INTRO))
+        plugin = self.make_plugin(
+            base_config(
+                share={"casual_mode": False, "intro_enabled": True},
+                interest={"use_llm_judge": True},
+            ),
+            ctx=ctx,
+        )
+        await plugin.run_round(reason="test")
+        prompt = ctx.llm.calls[0]["prompt"]
+        self.assertIn('"intro"', prompt)
+        self.assertIn("像在群里跟朋友随口安利", prompt)
+
+    async def test_casual_mode_clips_fallback_description(self) -> None:
+        long_description = "这是一段很长的视频简介，" * 20
+        ctx = FakeCtx(self.tmp_dir)
+        plugin = self.make_plugin(
+            base_config(share={"casual_mode": True, "casual_max_chars": 30}),
+            videos=[make_video(self.video_module, description=long_description)],
+            ctx=ctx,
+        )
+        await plugin.run_round(reason="test")
+        self.assertEqual(len(ctx.send.messages), 1)
+        text = ctx.send.messages[0]["text"]
+        self.assertNotIn(long_description, text)
+        self.assertLess(len(text), len(long_description))
+
     async def test_persona_block_reaches_llm_prompt(self) -> None:
         ctx = FakeCtx(self.tmp_dir, llm=FakeLlm(judge_response=JUDGE_WITH_INTRO))
         plugin = self.make_plugin(
@@ -865,7 +933,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults["schedule"]["interval_minutes"], 60)
         self.assertEqual(defaults["schedule"]["search_cooldown_seconds"], 300)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "1.0.3")
+        self.assertEqual(defaults["plugin"]["config_version"], "1.1.0")
         self.assertEqual(defaults["interest"]["llm_task_name"], "planner")
         self.assertEqual(defaults["vision"]["task_name"], "vlm")
         self.assertTrue(defaults["categories"])
@@ -966,7 +1034,7 @@ class PackagingTest(unittest.TestCase):
             raw = tomllib.load(handle)
         plugin = load_plugin_module().BilibiliInterestSharePlugin()
         plugin.set_plugin_config(raw)  # 不应抛异常
-        self.assertEqual(plugin.config.plugin.config_version, "1.0.3")
+        self.assertEqual(plugin.config.plugin.config_version, "1.1.0")
         self.assertEqual(plugin.config.streams, [])
         self.assertTrue(plugin.config.categories)
         self.assertEqual(plugin.config.vision.task_name, "vlm")

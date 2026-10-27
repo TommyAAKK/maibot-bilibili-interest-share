@@ -504,9 +504,12 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 narrative_text = str(judged.get("narrative") or "").strip()
                 intro_text = str(judged.get("intro") or "").strip()
             if not narrative_text and config.share.narrative_enabled:
-                narrative_text = (result.video.description or "").strip()[
-                    : config.share.narrative_max_chars
-                ]
+                fallback_limit = (
+                    config.share.casual_max_chars
+                    if config.share.casual_mode
+                    else config.share.narrative_max_chars
+                )
+                narrative_text = (result.video.description or "").strip()[:fallback_limit]
             sent = await self._send_parts(
                 stream_id,
                 result.video,
@@ -559,6 +562,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 narrative_max_chars=config.share.narrative_max_chars,
                 intro_enabled=config.share.intro_enabled,
                 intro_max_chars=config.share.intro_max_chars,
+                casual_mode=config.share.casual_mode,
+                casual_max_chars=config.share.casual_max_chars,
             )
             if judged is not None:
                 if not judged.get("relevant"):
@@ -586,6 +591,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                             narrative_max_chars=config.share.narrative_max_chars,
                             intro_enabled=config.share.intro_enabled,
                             intro_max_chars=config.share.intro_max_chars,
+                            casual_mode=config.share.casual_mode,
+                            casual_max_chars=config.share.casual_max_chars,
                         )
                         if refined is not None:
                             judged = refined
@@ -907,9 +914,25 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         kind: str = "auto",
         intro: str = "",
     ) -> bool:
-        """按「推荐语 / 标题+链接 / 自然语言介绍」分条发送。"""
+        """发送分享消息。
+
+        - 「随口一提」模式（``[share].casual_mode``，默认开）：把一句随口的话和
+          【标题】链接合成**一条**消息，像群里顺嘴提一句，不摆出「我在分享」的架势。
+        - 关闭时按「推荐语 / 标题+链接 / 自然语言介绍」分条发送。
+        """
 
         config = self.config
+        if kind != "shiwei" and config.share.casual_mode:
+            line = (narrative or "").strip()
+            header = format_share_header(video)
+            message = f"{line} {header}" if line else header
+            if config.share.include_stats_line:
+                message += (
+                    f"\n🔥 {video.play} 播放 · {video.like} 点赞"
+                    + (f" · UP：{video.owner}" if video.owner else "")
+                )
+            return await self._send_text(stream_id, message)
+
         parts: List[str] = []
         if kind != "shiwei" and config.share.intro_enabled:
             intro_text = (intro or "").strip()
@@ -1020,10 +1043,17 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                     narrative_max_chars=config.share.narrative_max_chars,
                     intro_enabled=config.share.intro_enabled,
                     intro_max_chars=config.share.intro_max_chars,
+                    casual_mode=config.share.casual_mode,
+                    casual_max_chars=config.share.casual_max_chars,
                 )
+            fallback_limit = (
+                config.share.casual_max_chars
+                if config.share.casual_mode
+                else config.share.narrative_max_chars
+            )
             narrative_text = str((judged or {}).get("narrative") or "") or (
                 video.description or ""
-            )[: config.share.narrative_max_chars]
+            )[:fallback_limit]
             intro_text = str((judged or {}).get("intro") or "")
             if await self._send_parts(
                 stream_id,

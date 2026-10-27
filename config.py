@@ -33,7 +33,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用麦麦刷B站")
-    config_version: str = Field(default="1.0.3", description="配置版本（由插件维护）")
+    config_version: str = Field(default="1.1.0", description="配置版本（由插件维护）")
 
 
 class ScheduleConfig(PluginConfigBase):
@@ -325,19 +325,29 @@ class ShareConfig(PluginConfigBase):
     __ui_icon__ = "send"
     __ui_order__ = 10
 
+    casual_mode: bool = Field(
+        default=True,
+        description=(
+            "「随口一提」模式：把一句话和【标题】链接合成一条消息，语气像群里随口说话，"
+            "不宣布「我要分享/推荐」这种意图；关闭则回到「推荐语 / 标题链接 / 介绍」分条格式"
+        ),
+    )
+    casual_max_chars: int = Field(
+        default=60, ge=20, le=160, description="随口一句的最大字数（仅「随口一提」模式生效）"
+    )
     intro_enabled: bool = Field(
         default=True,
-        description="是否先用一句人设口吻的推荐语开场（语气按 [persona] 读取的麦麦人设来）",
+        description="是否先用一句人设口吻的推荐语开场（仅关闭「随口一提」模式时生效）",
     )
     intro_max_chars: int = Field(default=40, ge=10, le=120, description="推荐语的最大字数")
     send_as_parts: bool = Field(
         default=True,
-        description="是否分条发送：①推荐语 ②【标题】链接 ③一段自然语言介绍；关闭则合成一条消息",
+        description="是否分条发送：①推荐语 ②【标题】链接 ③一段自然语言介绍；关闭则合成一条消息（「随口一提」模式下始终只发一条）",
     )
     part_delay_seconds: float = Field(default=0.8, ge=0.0, le=10.0, description="分条发送之间的间隔秒数")
     narrative_enabled: bool = Field(
         default=True,
-        description="是否发一段人设口吻的自然语言介绍（把「讲了什么」和「有什么好看」揉在一起，不用「内容：」「看点：」这类格式）",
+        description="是否发一段人设口吻的自然语言介绍（把「讲了什么」和「有什么好看」揉在一起，不用「内容：」「看点：」这类格式；仅关闭「随口一提」模式时生效）",
     )
     narrative_max_chars: int = Field(
         default=160, ge=40, le=500, description="自然语言介绍的最大字数"
