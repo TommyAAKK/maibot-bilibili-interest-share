@@ -64,7 +64,7 @@ def base_config(**overrides):
     """返回一份“一定会分享”的测试配置（默认关闭 LLM/抽帧/弹幕，保证确定性）。"""
 
     config = {
-        "plugin": {"enabled": True, "config_version": "1.1.1"},
+        "plugin": {"enabled": True, "config_version": "1.1.2"},
         "schedule": {
             "interval_minutes": 30,
             "jitter_seconds": 0,
@@ -933,7 +933,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults["schedule"]["interval_minutes"], 60)
         self.assertEqual(defaults["schedule"]["search_cooldown_seconds"], 300)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "1.1.1")
+        self.assertEqual(defaults["plugin"]["config_version"], "1.1.2")
         self.assertEqual(defaults["interest"]["llm_task_name"], "planner")
         self.assertEqual(defaults["vision"]["task_name"], "vlm")
         self.assertTrue(defaults["categories"])
@@ -1034,7 +1034,7 @@ class PackagingTest(unittest.TestCase):
             raw = tomllib.load(handle)
         plugin = load_plugin_module().BilibiliInterestSharePlugin()
         plugin.set_plugin_config(raw)  # 不应抛异常
-        self.assertEqual(plugin.config.plugin.config_version, "1.1.1")
+        self.assertEqual(plugin.config.plugin.config_version, "1.1.2")
         self.assertEqual(plugin.config.streams, [])
         self.assertTrue(plugin.config.categories)
         self.assertEqual(plugin.config.vision.task_name, "vlm")
@@ -1313,6 +1313,137 @@ class ConfigFieldBehaviorTests(unittest.IsolatedAsyncioTestCase):
         texts = [item["text"] for item in self.ctx.send.messages]
         self.assertNotIn("好嘞，再发一遍～", texts)
         self.assertTrue(texts)
+
+
+class StreamFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """同一个群存在多套会话（换连接器后旧账号会话残留）时的发送兜底。"""
+
+    GROUP_ID = "784084137"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_dir = Path(self._tmp.name)
+        self.module = load_plugin_module()
+        self.video_module = load_submodule("bilibili")
+
+    def make_plugin(self, *, all_streams=None, fail_streams=None, ctx=None):
+        ctx = ctx or FakeCtx(
+            self.tmp_dir,
+            group_streams={
+                self.GROUP_ID: {
+                    "stream_id": "dead-stream",
+                    "session_id": "dead-stream",
+                    "group_id": self.GROUP_ID,
+                }
+            },
+            all_streams=all_streams,
+            fail_streams=fail_streams,
+        )
+        plugin = self.module.BilibiliInterestSharePlugin()
+        plugin._set_context(ctx)
+        plugin.set_plugin_config(
+            base_config(
+                streams=[
+                    {
+                        "name": "测试群",
+                        "enabled": True,
+                        "stream_id": "",
+                        "group_id": self.GROUP_ID,
+                        "user_id": "",
+                        "interests": ["原神"],
+                        "categories": [],
+                        "auto_interest": False,
+                        "max_share_per_round": 0,
+                    }
+                ]
+            )
+        )
+        plugin._client = FakeClient(
+            videos=[make_video(self.video_module, bvid="BV1", title="原神新版本测评")]
+        )
+        plugin._store = self.module.SeenStore(
+            self.tmp_dir / "state.json", dedupe_days=30, max_records=1000
+        )
+        plugin._store.load()
+        plugin._data_dir = self.tmp_dir
+        plugin._frames = None
+        config = plugin.config
+        persona_module = load_submodule("persona")
+        plugin._persona = persona_module.PersonaProvider(
+            enabled=config.persona.enabled,
+            config_get=ctx.config.get,
+            override_name=config.persona.name,
+            override_personality=config.persona.personality,
+            override_reply_style=config.persona.reply_style,
+            style_hint=config.persona.style_hint,
+            cache_seconds=config.persona.cache_seconds,
+        )
+        plugin._judge = self.module.LlmJudge(
+            ctx.llm,
+            task_name=config.interest.llm_task_name,
+            vision_task_name=config.vision.task_name,
+            temperature=config.interest.llm_temperature,
+            persona_provider=plugin._persona,
+        )
+        return plugin, ctx
+
+    async def test_send_falls_back_to_live_session(self) -> None:
+        plugin, ctx = self.make_plugin(
+            all_streams=[
+                {"stream_id": "dead-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "live-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "other-stream", "group_id": "999"},
+            ],
+            fail_streams={"dead-stream"},
+        )
+        summary = await plugin.run_round(reason="test")
+        self.assertTrue(summary["ok"], summary)
+        self.assertEqual(summary["shared"], 1)
+        # 先试了死会话，再自动切到活会话
+        self.assertEqual(ctx.send.attempts[0]["stream_id"], "dead-stream")
+        self.assertEqual(ctx.send.messages[0]["stream_id"], "live-stream")
+        self.assertEqual(plugin._stream_overrides["dead-stream"], "live-stream")
+
+    async def test_override_is_reused_on_next_send(self) -> None:
+        plugin, ctx = self.make_plugin(
+            all_streams=[
+                {"stream_id": "dead-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "live-stream", "group_id": self.GROUP_ID},
+            ],
+            fail_streams={"dead-stream"},
+        )
+        await plugin.run_round(reason="test")
+        attempts_before = len(ctx.send.attempts)
+        self.assertTrue(await plugin._send_text("dead-stream", "第二条"))
+        self.assertEqual(len(ctx.send.attempts), attempts_before + 1)
+        self.assertEqual(ctx.send.attempts[-1]["stream_id"], "live-stream")
+
+    async def test_single_session_has_no_fallback(self) -> None:
+        plugin, ctx = self.make_plugin(
+            all_streams=[{"stream_id": "dead-stream", "group_id": self.GROUP_ID}],
+        )
+        summary = await plugin.run_round(reason="test")
+        self.assertEqual(summary["shared"], 1)
+        self.assertEqual(ctx.send.messages[0]["stream_id"], "dead-stream")
+        self.assertEqual(plugin._stream_fallbacks, {})
+
+    async def test_unsupported_all_streams_is_tolerated(self) -> None:
+        plugin, ctx = self.make_plugin(all_streams=None)
+        summary = await plugin.run_round(reason="test")
+        self.assertEqual(summary["shared"], 1)
+        self.assertEqual(ctx.send.messages[0]["stream_id"], "dead-stream")
+
+    async def test_allowed_streams_include_duplicates(self) -> None:
+        plugin, _ctx = self.make_plugin(
+            all_streams=[
+                {"stream_id": "dead-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "live-stream", "group_id": self.GROUP_ID},
+            ]
+        )
+        allowed = await plugin._refresh_allowed_streams()
+        self.assertIn("dead-stream", allowed)
+        self.assertIn("live-stream", allowed)
 
 
 if __name__ == "__main__":

@@ -210,6 +210,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         self._data_dir: Optional[Path] = None
         self._allowed_stream_ids: Set[str] = set()
         self._allowed_streams_at: float = 0.0
+        self._stream_fallbacks: Dict[str, List[str]] = {}
+        self._stream_overrides: Dict[str, str] = {}
         self._round_lock = asyncio.Lock()
         self.last_round: Optional[Dict[str, Any]] = None
         self.last_round_at: Optional[float] = None
@@ -261,6 +263,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             temperature=config.interest.llm_temperature,
             persona_provider=self._persona,
         )
+        self._stream_fallbacks.clear()
+        self._stream_overrides.clear()
         await self._persona.refresh()
         await self._refresh_allowed_streams()
 
@@ -821,6 +825,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             stream_id = await self._resolve_stream(target)
             if stream_id:
                 allowed.add(stream_id)
+                for alternative in self._stream_fallbacks.get(stream_id, ()):
+                    allowed.add(alternative)
         self._allowed_stream_ids = allowed
         self._allowed_streams_at = time.time()
         return allowed
@@ -834,28 +840,84 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return self._allowed_stream_ids
         return await self._refresh_allowed_streams()
 
+    async def _stream_candidates(self, target: Any, primary: str) -> List[str]:
+        """列出同一个群 / 同一个用户下的所有会话。
+
+        宿主换连接器 / 适配器之后，同一个群可能同时存在旧账号和新账号两套会话，
+        而 ``get_stream_by_group_id`` 只返回其中一个（可能是已经掉线的旧会话）。
+        这里把候选都收集起来，发送失败时好换下一个。
+        """
+
+        candidates: List[str] = []
+        if primary:
+            candidates.append(primary)
+        chat = getattr(self.ctx, "chat", None)
+        if chat is None:
+            return candidates
+        getter = getattr(chat, "get_all_streams", None)
+        if not callable(getter):
+            return candidates
+        try:
+            result = await getter("qq")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("枚举全部会话失败：%s", exc)
+            return candidates
+        streams = result.get("streams") if isinstance(result, dict) else result
+        if not isinstance(streams, list):
+            return candidates
+        group_id = str(getattr(target, "group_id", "") or "").strip()
+        user_id = str(getattr(target, "user_id", "") or "").strip()
+        for item in streams:
+            if not isinstance(item, dict):
+                continue
+            stream_id = _stream_id_of(item)
+            if not stream_id:
+                continue
+            if group_id:
+                matched = str(item.get("group_id") or "").strip() == group_id
+            elif user_id:
+                matched = str(item.get("user_id") or "").strip() == user_id
+            else:
+                matched = False
+            if matched and stream_id not in candidates:
+                candidates.append(stream_id)
+        return candidates
+
     async def _resolve_stream(self, target: Any) -> str:
-        """把白名单配置解析成真实的 stream_id。"""
+        """把白名单配置解析成真实的 stream_id。
+
+        同一群 / 用户可能对应多个会话（例如换连接器后旧账号的会话还在库里），
+        这里把其余候选记到 ``_stream_fallbacks``，发送失败时会自动切换。
+        """
 
         if target.stream_id:
             return str(target.stream_id).strip()
         chat = getattr(self.ctx, "chat", None)
         if chat is None:
             return ""
+        primary = ""
         try:
             if target.group_id:
                 stream = await chat.get_stream_by_group_id(str(target.group_id))
-                resolved = _stream_id_of(stream)
-                if resolved:
-                    return resolved
-            if target.user_id:
+                primary = _stream_id_of(stream)
+            if not primary and target.user_id:
                 stream = await chat.get_stream_by_user_id(str(target.user_id))
-                resolved = _stream_id_of(stream)
-                if resolved:
-                    return resolved
+                primary = _stream_id_of(stream)
         except Exception as exc:  # noqa: BLE001
             logger.warning("解析白名单会话失败（%s）：%s", target.name or target.group_id, exc)
-        return ""
+        if not primary:
+            return ""
+        candidates = await self._stream_candidates(target, primary)
+        alternatives = [item for item in candidates if item != primary]
+        if alternatives:
+            self._stream_fallbacks[primary] = alternatives
+            logger.debug(
+                "会话 %s 共有 %s 个候选会话（%s），发送失败时会自动切换",
+                target.name or target.group_id,
+                len(candidates),
+                ", ".join(candidates),
+            )
+        return primary
 
     async def _build_profile(self, target: Any, stream_id: str) -> InterestProfile:
         """构建会话兴趣画像：配置里的显式兴趣 + 近期聊天关键词。"""
@@ -919,7 +981,34 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
     # -- 发送 ----------------------------------------------------------
 
     async def _send_text(self, stream_id: str, text: str) -> bool:
-        """发送一条文本；``stream_id`` 为空时返回 False。"""
+        """发送一条文本；失败时自动换用同群 / 同用户的其他候选会话。
+
+        宿主换连接器后，同一个群可能同时挂着旧账号的会话和新账号的会话，
+        能力接口返回的可能正是那个已经掉线的旧会话（发送时报「未命中任何发送路由」）。
+        这种情况下换一个候选会话重试，并把可用的那个记下来。
+        """
+
+        text = (text or "").strip()
+        if not text or not stream_id:
+            return False
+        primary = self._stream_overrides.get(stream_id, stream_id)
+        if await self._send_text_once(primary, text):
+            return True
+        for alternative in self._stream_fallbacks.get(stream_id, ()) or ():
+            if alternative == primary:
+                continue
+            if await self._send_text_once(alternative, text):
+                self._stream_overrides[stream_id] = alternative
+                logger.info(
+                    "会话 %s 发送失败，已自动改用可用会话 %s",
+                    stream_id,
+                    alternative,
+                )
+                return True
+        return False
+
+    async def _send_text_once(self, stream_id: str, text: str) -> bool:
+        """向指定会话发送一条文本；``stream_id`` 为空时返回 False。"""
 
         text = (text or "").strip()
         if not text or not stream_id:

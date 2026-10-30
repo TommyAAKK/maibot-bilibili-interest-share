@@ -33,7 +33,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用麦麦刷B站")
-    config_version: str = Field(default="1.1.1", description="配置版本（由插件维护）")
+    config_version: str = Field(default="1.1.2", description="配置版本（由插件维护）")
 
 
 class ScheduleConfig(PluginConfigBase):

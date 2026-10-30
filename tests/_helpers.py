@@ -87,25 +87,39 @@ class FakeLogger:
 
 
 class FakeSend:
-    def __init__(self) -> None:
+    def __init__(self, fail_streams: Optional[Any] = None) -> None:
         self.messages: List[Dict[str, str]] = []
+        self.fail_streams = set(fail_streams or ())
+        self.attempts: List[Dict[str, str]] = []
 
     async def text(self, text: str, stream_id: str, **kwargs: Any) -> bool:
+        self.attempts.append({"stream_id": stream_id, "text": text})
+        if stream_id in self.fail_streams:
+            return {"success": False, "error": "未命中任何发送路由"}
         self.messages.append({"stream_id": stream_id, "text": text})
-        return True
+        return {"success": True}
 
 
 class FakeChat:
     def __init__(self, *, group_streams: Optional[Dict[str, Dict[str, Any]]] = None,
-                 user_streams: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+                 user_streams: Optional[Dict[str, Dict[str, Any]]] = None,
+                 all_streams: Optional[List[Dict[str, Any]]] = None) -> None:
         self.group_streams = group_streams or {}
         self.user_streams = user_streams or {}
+        self.all_streams = all_streams
+        self.all_stream_calls: List[str] = []
 
     async def get_stream_by_group_id(self, group_id: str) -> Optional[Dict[str, Any]]:
         return self.group_streams.get(str(group_id))
 
     async def get_stream_by_user_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         return self.user_streams.get(str(user_id))
+
+    async def get_all_streams(self, platform: str = "qq"):
+        self.all_stream_calls.append(platform)
+        if self.all_streams is None:
+            return {"success": False, "error": "unsupported"}
+        return {"success": True, "streams": list(self.all_streams)}
 
 
 class FakeMessage:
@@ -163,13 +177,19 @@ class FakeCtx:
         messages: Optional[List[Dict[str, Any]]] = None,
         group_streams: Optional[Dict[str, Dict[str, Any]]] = None,
         user_streams: Optional[Dict[str, Dict[str, Any]]] = None,
+        all_streams: Optional[List[Dict[str, Any]]] = None,
+        fail_streams: Optional[Any] = None,
         llm: Optional[FakeLlm] = None,
         config_values: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.paths = FakePaths(data_dir)
         self.logger = FakeLogger()
-        self.send = FakeSend()
-        self.chat = FakeChat(group_streams=group_streams, user_streams=user_streams)
+        self.send = FakeSend(fail_streams)
+        self.chat = FakeChat(
+            group_streams=group_streams,
+            user_streams=user_streams,
+            all_streams=all_streams,
+        )
         self.message = FakeMessage(messages)
         self.llm = llm if llm is not None else FakeLlm()
         self.config = FakeConfig(config_values)
