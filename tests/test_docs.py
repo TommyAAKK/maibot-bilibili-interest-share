@@ -39,6 +39,7 @@ STREAM_KEYS = [
     "group_id",
     "user_id",
     "interests",
+    "auto_interests",
     "categories",
     "auto_interest",
     "max_share_per_round",

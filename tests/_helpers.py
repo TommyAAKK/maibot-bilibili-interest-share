@@ -89,6 +89,7 @@ class FakeLogger:
 class FakeSend:
     def __init__(self, fail_streams: Optional[Any] = None) -> None:
         self.messages: List[Dict[str, str]] = []
+        self.images: List[Dict[str, str]] = []
         self.fail_streams = set(fail_streams or ())
         self.attempts: List[Dict[str, str]] = []
 
@@ -97,6 +98,13 @@ class FakeSend:
         if stream_id in self.fail_streams:
             return {"success": False, "error": "未命中任何发送路由"}
         self.messages.append({"stream_id": stream_id, "text": text})
+        return {"success": True}
+
+    async def image(self, image_base64: str, stream_id: str, **kwargs: Any) -> bool:
+        self.attempts.append({"stream_id": stream_id, "image": image_base64[:16]})
+        if stream_id in self.fail_streams:
+            return {"success": False, "error": "未命中任何发送路由"}
+        self.images.append({"stream_id": stream_id, "data": image_base64})
         return {"success": True}
 
 
@@ -123,13 +131,22 @@ class FakeChat:
 
 
 class FakeMessage:
-    def __init__(self, messages: Optional[List[Dict[str, Any]]] = None) -> None:
+    def __init__(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        messages_by_chat: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    ) -> None:
         self.messages = messages or []
+        # 按 chat_id 分别返回，用来模拟「旧账号会话没消息、新账号会话有消息」
+        self.messages_by_chat = messages_by_chat or {}
         self.calls: List[Dict[str, Any]] = []
 
     async def get_recent(self, chat_id: str, limit: int = 10):
         # 与宿主 SDK 2.15 的真实签名保持一致：只接受 chat_id / limit。
         self.calls.append({"chat_id": chat_id, "limit": limit})
+        if chat_id in self.messages_by_chat:
+            return list(self.messages_by_chat[chat_id])
         return list(self.messages)
 
 
@@ -193,6 +210,22 @@ class FakeCtx:
         self.message = FakeMessage(messages)
         self.llm = llm if llm is not None else FakeLlm()
         self.config = FakeConfig(config_values)
+        self.capability_calls: List[Dict[str, Any]] = []
+
+    async def call_capability(self, capability: str, timeout_ms: Any = None, **kwargs: Any) -> Any:
+        """假的通用能力调用：目前只需要支持 message.get_recent。"""
+
+        self.capability_calls.append({"capability": capability, **kwargs})
+        if capability == "message.get_recent":
+            # 测试里不区分 bot 消息，但把 filter_mai 记录下来方便断言
+            return {
+                "success": True,
+                "messages": await self.message.get_recent(
+                    chat_id=kwargs.get("chat_id", ""),
+                    limit=int(kwargs.get("limit") or 10),
+                ),
+            }
+        raise RuntimeError(f"未实现的能力：{capability}")
 
 
 class FakeClient:
@@ -220,6 +253,18 @@ class FakeClient:
         self.search_calls: List[Dict[str, Any]] = []
         self.detail_calls: List[Dict[str, Any]] = []
         self.download_calls: List[Dict[str, Any]] = []
+        self.cookie = ""
+
+    @property
+    def http(self) -> Any:
+        """登录相关代码会拿到底层 httpx 客户端，测试里给个占位对象即可。"""
+
+        return self._http
+
+    _http: Any = object()
+
+    def set_cookie(self, cookie: str) -> None:
+        self.cookie = cookie or ""
 
     async def fetch_popular(self, **kwargs: Any):
         self.popular_calls.append(kwargs)

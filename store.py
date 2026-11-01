@@ -16,12 +16,15 @@
       },
       "runs": [{"at": ..., "fetched": 40, "shared": 1, "targets": [...]}],
       "streams": {"<stream_id>": {"last_shared_at": ..., "shared_total": 3}},
-      "cooldowns": {"active_search": 1710000000.0, "shiwei": 1710000000.0}
+      "cooldowns": {"active_search": 1710000000.0, "shiwei": 1710000000.0},
+      "auto_interests": {"stream_id:123": ["原神", "编程"]}
     }
 
 - ``videos`` 就是「已经刷过的视频名单」：名单里的视频不会再被抓取/主动分享，
   但可以通过自然语言或 ``/bili-reshare`` 用缓存里的总结再次分享。
 - ``cooldowns`` 记录「主动搜索」与「赤石视频」各自的冷却时间。
+- ``auto_interests`` 记录插件上次写进 ``config.toml`` 的自动兴趣词，
+  用来判断用户之后有没有手改过（手改过就不再自动覆盖）。
 
 写入采用「临时文件 + 原子替换」，避免进程中断把状态写坏。
 """
@@ -62,6 +65,8 @@ class SeenStore:
         self._runs: List[Dict[str, Any]] = []
         self._streams: Dict[str, Dict[str, Any]] = {}
         self._cooldowns: Dict[str, float] = {}
+        self._auto_interests: Dict[str, List[str]] = {}
+        self._meta: Dict[str, Any] = {}
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -113,6 +118,16 @@ class SeenStore:
                     self._cooldowns[str(key)] = float(value)
                 except (TypeError, ValueError):
                     continue
+        auto_interests = data.get("auto_interests")
+        if isinstance(auto_interests, dict):
+            for key, value in auto_interests.items():
+                if isinstance(value, list):
+                    self._auto_interests[str(key)] = [
+                        str(item) for item in value if str(item or "").strip()
+                    ]
+        meta = data.get("meta")
+        if isinstance(meta, dict):
+            self._meta = dict(meta)
         self._prune()
 
     def save(self) -> None:
@@ -123,6 +138,8 @@ class SeenStore:
             "runs": self._runs[-_MAX_RUN_HISTORY:],
             "streams": self._streams,
             "cooldowns": self._cooldowns,
+            "auto_interests": self._auto_interests,
+            "meta": self._meta,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_name(self.path.name + ".tmp")
@@ -294,6 +311,31 @@ class SeenStore:
 
     def mark_cooldown(self, kind: str, *, now: Optional[float] = None) -> None:
         self._cooldowns[str(kind)] = time.time() if now is None else now
+
+    # ------------------------------------------------------------------
+    # 自动兴趣写回记录
+    # ------------------------------------------------------------------
+
+    def get_auto_interests(self, key: str) -> Optional[List[str]]:
+        """取上次写进配置的自动兴趣词；没记录过返回 None。"""
+
+        value = self._auto_interests.get(str(key))
+        return list(value) if isinstance(value, list) else None
+
+    def set_auto_interests(self, key: str, terms: Sequence[str]) -> None:
+        """记录这次写进配置的自动兴趣词。"""
+
+        self._auto_interests[str(key)] = [str(item) for item in terms if str(item or "").strip()]
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        """取一条通用元信息（例如「上次写配置文件的时间」）。"""
+
+        return self._meta.get(str(key), default)
+
+    def set_meta(self, key: str, value: Any) -> None:
+        """写一条通用元信息。"""
+
+        self._meta[str(key)] = value
 
     # ------------------------------------------------------------------
     # 运行记录

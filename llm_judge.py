@@ -48,6 +48,136 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_JSON_ARRAY_RE = re.compile(r"\[[^\[\]]*\]", re.S)
+
+
+def _parse_term_list(text: str, limit: int) -> List[str]:
+    """从模型回复里抠出一个字符串数组（兴趣词）。
+
+    容忍 ```json 代码块、前后废话、以及模型把数组包在对象里的情况。
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return []
+    candidates: List[str] = []
+    match = _JSON_BLOCK_RE.search(text)
+    if match:
+        candidates.append(match.group(1))
+    candidates.append(text)
+    array_match = _JSON_ARRAY_RE.search(text)
+    if array_match:
+        candidates.append(array_match.group(0))
+
+    for candidate in candidates:
+        raw = candidate.strip()
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            for key in ("interests", "terms", "keywords", "list", "items"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    data = value
+                    break
+            else:
+                continue
+        if not isinstance(data, list):
+            continue
+        terms = _clean_terms(data, limit)
+        if terms:
+            return terms
+    # 模型偶尔不按 JSON 输出（直接写「1. 游戏」或把词用引号括起来），
+    # 严格的 JSON 解析会全部失败——这里再兜一层，尽量捞回能用的词。
+    return _scavenge_terms(text, limit)
+
+
+_QUOTED_TERM_RE = re.compile(r"[“\"']([^“”\"'\n]{1,20})[”\"']")
+_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•·]|\(?\d{1,2}[.)、]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
+_TERM_NOISE_RE = re.compile(r"[，。！？；：、（）()\[\]{}<>《》/\\|=+*#$%^&@~`]")
+_NOT_A_TERM = {
+    "json",
+    "json数组",
+    "数组",
+    "兴趣",
+    "兴趣方向",
+    "推荐",
+    "解释",
+    "说明",
+    "输出",
+    "例如",
+    "比如",
+}
+
+
+def _clean_terms(items: Any, limit: int) -> List[str]:
+    """把候选列表清洗成兴趣词（去重、限长、丢弃明显不是词的项）。"""
+
+    if not isinstance(items, (list, tuple)):
+        return []
+    terms: List[str] = []
+    seen = set()
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("term") or item.get("name") or item.get("interest") or ""
+        term = str(item or "").strip().strip("\"'，,、 ")
+        if not term or len(term) > 20 or term in seen:
+            continue
+        if term.lower() in _NOT_A_TERM:
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) >= max(1, int(limit)):
+            break
+    return terms
+
+
+def _scavenge_terms(text: str, limit: int) -> List[str]:
+    """JSON 解析失败时，从自由文本里尽量捞出兴趣词。"""
+
+    if not isinstance(text, str) or not text.strip():
+        return []
+    # 有左方括号说明模型确实在输出数组，只是可能被截断（缺右括号），
+    # 这种就按引号把已经写出来的词捞回来。
+    if "[" in text:
+        found = [match.group(1) for match in _QUOTED_TERM_RE.finditer(text)]
+        if not found:
+            found = re.findall(r'"([^"\n]{1,20})"', text)
+        return _usable_terms(found, limit)
+    # 只有花括号说明是对象（比如把判断结果当成兴趣列表返回了），别把字段名当兴趣词。
+    if "{" in text:
+        return []
+    found = [match.group(1) for match in _QUOTED_TERM_RE.finditer(text)]
+    if not found:
+        # 没有引号就按列表项切，常见形态是「1. 游戏」「- 原神」「游戏、原神」；
+        # 整句散文（带句号/问号/感叹号）直接跳过，免得捞出半句话。
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _BULLET_PREFIX_RE.match(stripped):
+                rest = _BULLET_PREFIX_RE.sub("", stripped)
+                found.extend(re.split(r"[、,，;；]", rest))
+                continue
+            if any(mark in stripped for mark in "。！？"):
+                continue
+            found.extend(re.split(r"[、,，;；]", stripped))
+    return _usable_terms(found, limit)
+
+
+def _usable_terms(items: Any, limit: int) -> List[str]:
+    """清洗兜底捞出来的词：去掉标点/数字/太短的碎片。"""
+
+    if not isinstance(items, (list, tuple)):
+        items = list(items or [])
+    usable = [
+        item
+        for item in _clean_terms(items, len(items))
+        if not _TERM_NOISE_RE.search(item) and not item.isdigit() and len(item) >= 2
+    ]
+    return usable[: max(1, int(limit))]
+
+
 def _clip(text: str, limit: int) -> str:
     text = (text or "").replace("\n", " ").strip()
     if len(text) <= limit:
@@ -222,6 +352,53 @@ class LlmJudge:
             text = result.get("response") or result.get("text") or ""
             return text if isinstance(text, str) else str(text)
         return str(result or "")
+
+    async def seed_interests(
+        self,
+        *,
+        persona_block: str = "",
+        count: int = 8,
+    ) -> List[str]:
+        """还没有任何兴趣时，按人设生成一份初始兴趣词。
+
+        只在「聊天流既没有手写兴趣、近期聊天也提不出关键词」时使用，
+        目的是让新群第一次刷 B 站时有点方向，而不是完全随机。
+
+        返回归一化后的兴趣词列表；模型不可用或解析失败时返回空列表。
+        """
+
+        if self._llm is None:
+            return []
+        count = max(3, min(20, int(count)))
+        block = (persona_block or "").strip()
+        lines = [
+            f"根据下面的机器人人设，给出 {count} 个它适合去 B 站刷、去分享的兴趣方向。",
+            "",
+        ]
+        if block:
+            lines.extend([block, ""])
+        lines.extend(
+            [
+                "要求：",
+                f"- 只输出一个 JSON 数组，共 {count} 个字符串；",
+                "- 不要开场白、不要解释、不要编号、不要代码块标记；",
+                "- 每个词 2~6 个字，是 B 站上真实存在的内容方向"
+                "（如 游戏、原神、编程、机械键盘、猫咪、搞笑整活）；",
+                "- 不要写太宽泛的词（如 视频、内容、娱乐），也不要写人名。",
+                "",
+                "直接输出数组，例如：[\"游戏\", \"原神\"]",
+            ]
+        )
+        prompt = [{"role": "user", "content": "\n".join(lines)}]
+        # 给足 token：模型有时会先写一句解释再输出数组，300 容易被截断
+        # （线上实测提示词 867 tok、输出 412 tok 就把数组吃掉了）。
+        text = await self._generate(prompt, task_name=self.task_name, max_tokens=800)
+        terms = _parse_term_list(text, count)
+        if not terms and text.strip():
+            self._logger.info(
+                "人设初始兴趣解析失败，模型原始输出：%s", _clip(text, 200)
+            )
+        return terms
 
     async def describe_frames(self, video: Any, frames: Sequence[str]) -> str:
         """让视觉模型描述抽到的帧。"""

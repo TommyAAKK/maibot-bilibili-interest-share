@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from _helpers import (  # noqa: E402
     FakeClient,
     FakeCtx,
     FakeLlm,
+    FakeMessage,
     deep_merge,
     load_plugin_module,
     load_submodule,
@@ -64,7 +66,7 @@ def base_config(**overrides):
     """返回一份“一定会分享”的测试配置（默认关闭 LLM/抽帧/弹幕，保证确定性）。"""
 
     config = {
-        "plugin": {"enabled": True, "config_version": "1.1.2"},
+        "plugin": {"enabled": True, "config_version": "2.0.0"},
         "schedule": {
             "interval_minutes": 30,
             "jitter_seconds": 0,
@@ -662,7 +664,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             ctx=ctx,
         )
         await plugin.run_round(reason="test")
-        prompt = ctx.llm.calls[0]["prompt"]
+        prompt = ctx.llm.calls[-1]["prompt"]
         self.assertIn("随口", prompt)
         self.assertIn("不要用「推荐」「分享」「安利」", prompt)
         self.assertIn("50 字", prompt)
@@ -679,7 +681,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
             ctx=ctx,
         )
         await plugin.run_round(reason="test")
-        prompt = ctx.llm.calls[0]["prompt"]
+        prompt = ctx.llm.calls[-1]["prompt"]
         self.assertIn('"intro"', prompt)
         self.assertIn("像在群里跟朋友随口安利", prompt)
 
@@ -712,7 +714,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         )
         await plugin.run_round(reason="test")
         self.assertTrue(ctx.llm.calls)
-        prompt = ctx.llm.calls[0]["prompt"]
+        prompt = ctx.llm.calls[-1]["prompt"]
         self.assertIn("小鲸鱼", prompt)
         self.assertIn("虚拟鲸鱼", prompt)
 
@@ -933,7 +935,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults["schedule"]["interval_minutes"], 60)
         self.assertEqual(defaults["schedule"]["search_cooldown_seconds"], 300)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "1.1.2")
+        self.assertEqual(defaults["plugin"]["config_version"], "2.0.0")
         self.assertEqual(defaults["interest"]["llm_task_name"], "planner")
         self.assertEqual(defaults["vision"]["task_name"], "vlm")
         self.assertTrue(defaults["categories"])
@@ -946,6 +948,534 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         dumped = json.dumps(schema, ensure_ascii=False)
         for key in ("streams", "interval_minutes", "categories", "shiwei", "vision"):
             self.assertIn(key, dumped)
+
+    # -- 账号登录 ------------------------------------------------------
+
+    def _write_config_file(self, plugin) -> Path:
+        """把一份带 [[streams]] 的 config.toml 放到临时目录，并让插件指向它。"""
+
+        path = self.tmp_dir / "config.toml"
+        path.write_text(
+            "[plugin]\nenabled = true\nconfig_version = \"2.0.0\"\n\n"
+            "[account]\ncookie = \"\"\n\n"
+            "[interest]\npersona_seed_interests = []\n\n"
+            "[[streams]]\nname = \"测试群\"\nenabled = true\n"
+            "group_id = \"12345\"\ninterests = []\nauto_interests = []\n",
+            encoding="utf-8",
+        )
+        plugin._config_file = lambda: path
+        return path
+
+    def test_effective_cookie_prefers_account_section(self) -> None:
+        plugin = self.make_plugin(
+            base_config(
+                account={"cookie": "SESSDATA=new"},
+                advanced={"cookie": "SESSDATA=old"},
+            )
+        )
+        self.assertEqual(plugin._effective_cookie(), "SESSDATA=new")
+
+    def test_effective_cookie_falls_back_to_legacy(self) -> None:
+        plugin = self.make_plugin(
+            base_config(account={"cookie": ""}, advanced={"cookie": "SESSDATA=old"})
+        )
+        self.assertEqual(plugin._effective_cookie(), "SESSDATA=old")
+
+    async def test_apply_login_cookie_updates_client_memory_and_file(self) -> None:
+        plugin = self.make_plugin()
+        path = self._write_config_file(plugin)
+        await plugin._apply_login_cookie("SESSDATA=abc; bili_jct=1", "stream-1")
+        self.assertEqual(plugin._client.cookie, "SESSDATA=abc; bili_jct=1")
+        self.assertEqual(plugin.config.account.cookie, "SESSDATA=abc; bili_jct=1")
+        self.assertIn("SESSDATA=abc", path.read_text(encoding="utf-8"))
+        joined = "\n".join(self.ctx.send.messages[-1:][0]["text"] for _ in [0])
+        self.assertIn("登录成功", joined)
+
+    async def test_apply_login_cookie_empty_is_reported(self) -> None:
+        plugin = self.make_plugin()
+        self._write_config_file(plugin)
+        await plugin._apply_login_cookie("", "stream-1")
+        self.assertIn("没取到 Cookie", self.ctx.send.messages[-1]["text"])
+
+    async def test_login_command_rejects_concurrent_task(self) -> None:
+        plugin = self.make_plugin()
+        plugin._login_task = asyncio.create_task(asyncio.sleep(0.2))
+        try:
+            ok, text, _ = await plugin.cmd_login(session_id="stream-1")
+        finally:
+            plugin._login_task.cancel()
+        self.assertTrue(ok)
+        self.assertIn("进行中", text)
+        self.assertIn("进行中", self.ctx.send.messages[-1]["text"])
+
+    async def test_login_command_requires_stream(self) -> None:
+        plugin = self.make_plugin()
+        ok, text, _ = await plugin.cmd_login()
+        self.assertTrue(ok)
+        self.assertIn("需要在一个聊天里发起", text)
+
+    async def test_login_command_without_client_reports(self) -> None:
+        plugin = self.make_plugin()
+        plugin._client = None
+        ok, text, _ = await plugin.cmd_login(session_id="stream-1")
+        self.assertTrue(ok)
+        self.assertIn("还没加载完成", text)
+
+    async def test_login_command_is_rejected_in_group_chat(self) -> None:
+        plugin = self.make_plugin()
+        ok, text, _ = await plugin.cmd_login(session_id="stream-1", group_id="12345")
+        self.assertTrue(ok)
+        self.assertIn("只能在私聊", text)
+        self.assertIsNone(plugin._login_task, "群聊里不应该真的发起扫码登录")
+
+    async def test_login_command_allowed_in_private_chat(self) -> None:
+        plugin = self.make_plugin()
+        ok, text, _ = await plugin.cmd_login(session_id="stream-1", group_id="")
+        self.assertTrue(ok)
+        self.assertIn("正在生成登录二维码", text)
+        self.assertIsNotNone(plugin._login_task)
+        plugin._login_task.cancel()
+
+    async def test_send_image_uses_base64_without_data_uri(self) -> None:
+        plugin = self.make_plugin()
+        sent = await plugin._send_image("stream-1", b"\x89PNG-fake")
+        self.assertTrue(sent)
+        self.assertEqual(len(self.ctx.send.images), 1)
+        payload = self.ctx.send.images[0]["data"]
+        self.assertNotIn("data:image", payload)
+        self.assertEqual(payload, "iVBORy1mYWtl")
+
+    async def test_send_image_falls_back_to_alternative_stream(self) -> None:
+        plugin = self.make_plugin()
+        plugin._stream_fallbacks["stream-1"] = ["stream-2"]
+        self.ctx.send.fail_streams.add("stream-1")
+        sent = await plugin._send_image("stream-1", b"png")
+        self.assertTrue(sent)
+        self.assertEqual(self.ctx.send.images[0]["stream_id"], "stream-2")
+
+    # -- 自动兴趣写回 / 人设初始兴趣 ------------------------------------
+
+    async def test_auto_interests_are_written_back_to_config(self) -> None:
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": True,
+                }
+            ],
+            interest={"use_recent_chat": True, "use_llm_judge": False},
+        )
+        plugin = self.make_plugin(config)
+        path = self._write_config_file(plugin)
+        plugin.ctx.message.messages = [
+            {
+                "timestamp": str(int(time.time())),
+                "processed_plain_text": "原神新版本真好玩，原神太强了",
+            }
+            for _ in range(3)
+        ]
+        profile = await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        self.assertTrue(profile.sorted_terms())
+        # 写回是攒到轮末才落盘的，这里手动触发一次
+        plugin._flush_pending_config_writes()
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("auto_interests", text)
+        self.assertIn("原神", text)
+        # 内存里的配置对象也同步了，设置页刷新能看到
+        self.assertIn("原神", plugin.config.streams[0].auto_interests)
+
+    async def test_auto_interests_locked_after_manual_edit(self) -> None:
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": ["手动改的词"],
+                    "auto_interest": True,
+                }
+            ]
+        )
+        plugin = self.make_plugin(config)
+        path = self._write_config_file(plugin)
+        before = path.read_text(encoding="utf-8")
+        plugin.ctx.message.messages = [
+            {"timestamp": str(int(time.time())), "processed_plain_text": "原神原神原神"}
+            for _ in range(3)
+        ]
+        await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        plugin._flush_pending_config_writes()
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    async def test_config_writes_are_deferred_until_flush(self) -> None:
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": True,
+                }
+            ],
+            interest={"use_recent_chat": True, "use_llm_judge": False},
+        )
+        plugin = self.make_plugin(config)
+        path = self._write_config_file(plugin)
+        before = path.read_text(encoding="utf-8")
+        plugin.ctx.message.messages = [
+            {
+                "timestamp": str(int(time.time())),
+                "processed_plain_text": "原神新版本真好玩，原神太强了",
+            }
+            for _ in range(3)
+        ]
+        await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        # 提取阶段不写盘，否则宿主的 config.toml 一变就会重载插件、把本轮打断
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertTrue(plugin._pending_stream_writes)
+        plugin._flush_pending_config_writes()
+        self.assertFalse(plugin._pending_stream_writes)
+        self.assertIn("原神", path.read_text(encoding="utf-8"))
+
+    async def test_auto_interests_not_rewritten_when_only_order_changes(self) -> None:
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": ["原神", "编程"],
+                    "auto_interest": True,
+                }
+            ],
+            interest={"use_recent_chat": True, "use_llm_judge": False},
+        )
+        plugin = self.make_plugin(config)
+        self._write_config_file(plugin)
+        # 上次写的就是这两个词，只是顺序不同 —— 不该再写一遍
+        plugin._store.set_auto_interests("group_id:12345", ["编程", "原神"])
+        await plugin._persist_auto_interests(plugin.config.streams[0], ["原神", "编程"])
+        self.assertFalse(plugin._pending_stream_writes)
+
+    async def test_run_round_flushes_pending_writes(self) -> None:
+        ctx = FakeCtx(
+            self.tmp_dir,
+            group_streams={"12345": {"stream_id": "grp-stream", "session_id": "grp-stream"}},
+        )
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": True,
+                }
+            ],
+            interest={"use_recent_chat": True, "use_llm_judge": False},
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        path = self._write_config_file(plugin)
+        plugin.ctx.message.messages = [
+            {
+                "timestamp": str(int(time.time())),
+                "processed_plain_text": "原神新版本真好玩，原神太强了",
+            }
+            for _ in range(3)
+        ]
+        await plugin.run_round(reason="test", manual=True)
+        # 一轮跑完才落盘，且此时不会再打断任何东西
+        self.assertIn("原神", path.read_text(encoding="utf-8"))
+
+    async def test_persona_name_is_not_extracted_as_interest(self) -> None:
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": True,
+                }
+            ],
+            interest={"use_recent_chat": True, "use_llm_judge": False},
+            persona={"enabled": True, "name": "小鲸鱼"},
+        )
+        plugin = self.make_plugin(config)
+        path = self._write_config_file(plugin)
+        await plugin._persona.refresh()
+        # 群里一直在喊 bot 的名字，同时也聊原神
+        plugin.ctx.message.messages = [
+            {
+                "timestamp": str(int(time.time())),
+                "processed_plain_text": "小鲸鱼小鲸鱼，原神新版本你玩了吗",
+            }
+            for _ in range(4)
+        ]
+        await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        written = plugin.config.streams[0].auto_interests
+        self.assertTrue(written, "应该有自动兴趣写回")
+        self.assertNotIn("小鲸鱼", written)
+        self.assertTrue(any("原神" in term for term in written), written)
+        plugin._flush_pending_config_writes()
+        text = path.read_text(encoding="utf-8")
+        self.assertNotIn("小鲸鱼", text)
+
+    async def test_persona_alias_is_not_extracted_as_interest(self) -> None:
+        ctx = FakeCtx(
+            self.tmp_dir,
+            config_values={
+                "bot.nickname": "小鲸鱼",
+                "bot.alias_names": ["大肥鱼", "鲸鱼娘"],
+            },
+        )
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": True,
+                }
+            ],
+            interest={"use_recent_chat": True, "use_llm_judge": False},
+            persona={"enabled": True},
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        self._write_config_file(plugin)
+        await plugin._persona.refresh()
+        plugin.ctx.message.messages = [
+            {
+                "timestamp": str(int(time.time())),
+                "processed_plain_text": "大肥鱼鲸鱼娘，这期机械键盘测评真不错",
+            }
+            for _ in range(4)
+        ]
+        await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        written = plugin.config.streams[0].auto_interests
+        self.assertTrue(written, "应该有自动兴趣写回")
+        for noise in ("大肥鱼", "鲸鱼娘", "小鲸鱼"):
+            self.assertFalse(any(noise in term for term in written), written)
+
+    def test_is_persona_noise_ignores_short_aliases(self) -> None:
+        plugin = self.make_plugin()
+        # 单字别名不做包含匹配，否则「鱼」会把「钓鱼」误杀
+        self.assertFalse(plugin._is_persona_noise("钓鱼", {"鱼"}))
+        self.assertTrue(plugin._is_persona_noise("鱼", {"鱼"}))
+        # 两字以上的别名按包含关系判断
+        self.assertTrue(plugin._is_persona_noise("大肥鱼", {"肥鱼"}))
+        self.assertTrue(plugin._is_persona_noise("鲸鱼", {"小鲸鱼"}))
+        self.assertFalse(plugin._is_persona_noise("原神", {"小鲸鱼"}))
+        # 空词一律算噪声
+        self.assertTrue(plugin._is_persona_noise("", {"小鲸鱼"}))
+
+    async def test_persona_seed_used_when_no_interests(self) -> None:
+        llm = FakeLlm(judge_response='["游戏", "动画", "美食"]')
+        ctx = FakeCtx(self.tmp_dir, llm=llm)
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": False,
+                }
+            ],
+            interest={
+                "use_recent_chat": False,
+                "use_llm_judge": True,
+                "persona_seed_enabled": True,
+            },
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        path = self._write_config_file(plugin)
+        profile = await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        self.assertEqual(
+            sorted(term for term, _weight in profile.sorted_terms()),
+            sorted(["游戏", "动画", "美食"]),
+        )
+        # 人设初始兴趣是通用配置，写进 [interest].persona_seed_interests
+        plugin._flush_pending_config_writes()
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("[interest]", text)
+        self.assertIn("动画", text)
+        self.assertEqual(
+            sorted(plugin.config.interest.persona_seed_interests),
+            sorted(["游戏", "动画", "美食"]),
+        )
+        # 而不是写进某个聊天流的 auto_interests
+        self.assertEqual(plugin.config.streams[0].auto_interests, [])
+        # 确实调用了 LLM
+        self.assertTrue(llm.calls)
+
+    async def test_persona_seed_interests_reused_without_llm(self) -> None:
+        llm = FakeLlm(judge_response='["不该被调用"]')
+        ctx = FakeCtx(self.tmp_dir, llm=llm)
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": False,
+                }
+            ],
+            interest={
+                "use_recent_chat": False,
+                "use_llm_judge": True,
+                "persona_seed_enabled": True,
+                "persona_seed_interests": ["游戏", "动画"],
+            },
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        self._write_config_file(plugin)
+        profile = await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        self.assertEqual(
+            sorted(term for term, _weight in profile.sorted_terms()),
+            sorted(["游戏", "动画"]),
+        )
+        self.assertFalse(llm.calls, "配置里已经有人设初始兴趣时不该再调 LLM")
+
+    async def test_run_round_generates_persona_seed_even_with_stream_interests(self) -> None:
+        """就算每个流都写了兴趣，只要通用的人设初始兴趣还是空的，也生成一次。"""
+
+        llm = FakeLlm(judge_response='["游戏", "动画"]')
+        ctx = FakeCtx(
+            self.tmp_dir,
+            llm=llm,
+            group_streams={"12345": {"stream_id": "grp-stream", "session_id": "grp-stream"}},
+        )
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": ["原神"],
+                    "auto_interests": [],
+                    "auto_interest": False,
+                }
+            ],
+            interest={
+                "use_recent_chat": False,
+                "use_llm_judge": True,
+                "persona_seed_enabled": True,
+                "persona_seed_interests": [],
+            },
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        path = self._write_config_file(plugin)
+        await plugin.run_round(reason="test", manual=True)
+        self.assertEqual(
+            sorted(plugin.config.interest.persona_seed_interests),
+            sorted(["游戏", "动画"]),
+        )
+        self.assertIn("动画", path.read_text(encoding="utf-8"))
+
+    async def test_persona_seed_not_generated_twice(self) -> None:
+        """已经生成过一次之后，下一轮不该再调 LLM。"""
+
+        llm = FakeLlm(judge_response='["游戏"]')
+        ctx = FakeCtx(
+            self.tmp_dir,
+            llm=llm,
+            group_streams={"12345": {"stream_id": "grp-stream", "session_id": "grp-stream"}},
+        )
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": ["原神"],
+                    "auto_interests": [],
+                    "auto_interest": False,
+                }
+            ],
+            interest={
+                "use_recent_chat": False,
+                "use_llm_judge": True,
+                "persona_seed_enabled": True,
+                "persona_seed_interests": [],
+            },
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        self._write_config_file(plugin)
+        await plugin.run_round(reason="test", manual=True)
+        first_calls = len(llm.calls)
+        self.assertTrue(first_calls)
+        await plugin.run_round(reason="test", manual=True)
+        self.assertEqual(len(llm.calls), first_calls, "第二轮不该再生成一遍")
+
+    async def test_persona_seed_disabled_yields_empty_profile(self) -> None:
+        llm = FakeLlm(judge_response='["游戏"]')
+        ctx = FakeCtx(self.tmp_dir, llm=llm)
+        config = base_config(
+            streams=[
+                {
+                    "name": "测试群",
+                    "enabled": True,
+                    "group_id": "12345",
+                    "interests": [],
+                    "auto_interests": [],
+                    "auto_interest": False,
+                }
+            ],
+            interest={
+                "use_recent_chat": False,
+                "use_llm_judge": True,
+                "persona_seed_enabled": False,
+            },
+        )
+        plugin = self.make_plugin(config, ctx=ctx)
+        self._write_config_file(plugin)
+        profile = await plugin._build_profile(plugin.config.streams[0], "stream-1")
+        self.assertEqual(profile.sorted_terms(), [])
+
+    def test_status_reports_login_and_interests(self) -> None:
+        plugin = self.make_plugin(
+            base_config(
+                streams=[
+                    {
+                        "name": "测试群",
+                        "enabled": True,
+                        "group_id": "12345",
+                        "interests": ["手写词"],
+                        "auto_interests": ["自动词"],
+                        "auto_interest": True,
+                    }
+                ]
+            )
+        )
+        text = plugin._format_status()
+        self.assertIn("B 站登录：未登录", text)
+        self.assertIn("手写：手写词", text)
+        self.assertIn("自动：自动词", text)
+
+    def test_status_reports_logged_in(self) -> None:
+        plugin = self.make_plugin(base_config(account={"cookie": "SESSDATA=x"}))
+        login_module = load_submodule("bilibili_login")
+        plugin._login_state = login_module.LoginState(
+            status="success", message="", cookie="SESSDATA=x", uname="小鲸鱼"
+        )
+        self.assertIn("已登录（小鲸鱼）", plugin._account_desc())
+
 
 
 class PackagingTest(unittest.TestCase):
@@ -1034,7 +1564,7 @@ class PackagingTest(unittest.TestCase):
             raw = tomllib.load(handle)
         plugin = load_plugin_module().BilibiliInterestSharePlugin()
         plugin.set_plugin_config(raw)  # 不应抛异常
-        self.assertEqual(plugin.config.plugin.config_version, "1.1.2")
+        self.assertEqual(plugin.config.plugin.config_version, "2.0.0")
         self.assertEqual(plugin.config.streams, [])
         self.assertTrue(plugin.config.categories)
         self.assertEqual(plugin.config.vision.task_name, "vlm")
@@ -1327,7 +1857,7 @@ class StreamFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.module = load_plugin_module()
         self.video_module = load_submodule("bilibili")
 
-    def make_plugin(self, *, all_streams=None, fail_streams=None, ctx=None):
+    def make_plugin(self, *, all_streams=None, fail_streams=None, ctx=None, config=None):
         ctx = ctx or FakeCtx(
             self.tmp_dir,
             group_streams={
@@ -1343,7 +1873,9 @@ class StreamFallbackTests(unittest.IsolatedAsyncioTestCase):
         plugin = self.module.BilibiliInterestSharePlugin()
         plugin._set_context(ctx)
         plugin.set_plugin_config(
-            base_config(
+            config
+            if config is not None
+            else base_config(
                 streams=[
                     {
                         "name": "测试群",
@@ -1444,6 +1976,272 @@ class StreamFallbackTests(unittest.IsolatedAsyncioTestCase):
         allowed = await plugin._refresh_allowed_streams()
         self.assertIn("dead-stream", allowed)
         self.assertIn("live-stream", allowed)
+
+    async def test_recent_messages_fall_back_to_live_session(self) -> None:
+        """旧会话没有近期消息时，从同群的新会话读聊天记录（否则自动兴趣永远是空的）。"""
+
+        now = time.time()
+        ctx = FakeCtx(
+            self.tmp_dir,
+            group_streams={
+                self.GROUP_ID: {
+                    "stream_id": "dead-stream",
+                    "session_id": "dead-stream",
+                    "group_id": self.GROUP_ID,
+                }
+            },
+            all_streams=[
+                {"stream_id": "dead-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "live-stream", "group_id": self.GROUP_ID},
+            ],
+        )
+        ctx.message = FakeMessage(
+            messages_by_chat={
+                "dead-stream": [],
+                "live-stream": [
+                    {"text": "原神新版本真香", "timestamp": str(int(now))},
+                    {"text": "原神又出角色了", "timestamp": str(int(now))},
+                ],
+            }
+        )
+        plugin, _ = self.make_plugin(ctx=ctx)
+        await plugin._refresh_allowed_streams()
+
+        messages = await plugin._recent_messages("dead-stream")
+        self.assertEqual(len(messages), 2)
+        # 记住有消息的那个会话，后续发送也优先用它
+        self.assertEqual(plugin._stream_overrides["dead-stream"], "live-stream")
+
+    async def test_recent_messages_prefer_known_live_session(self) -> None:
+        """已经记住可用会话后，直接读它，不用再试死会话。"""
+
+        now = time.time()
+        ctx = FakeCtx(
+            self.tmp_dir,
+            group_streams={
+                self.GROUP_ID: {
+                    "stream_id": "dead-stream",
+                    "session_id": "dead-stream",
+                    "group_id": self.GROUP_ID,
+                }
+            },
+            all_streams=[
+                {"stream_id": "dead-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "live-stream", "group_id": self.GROUP_ID},
+            ],
+        )
+        ctx.message = FakeMessage(
+            messages_by_chat={
+                "dead-stream": [],
+                "live-stream": [{"text": "原神", "timestamp": str(int(now))}],
+            }
+        )
+        plugin, _ = self.make_plugin(ctx=ctx)
+        await plugin._refresh_allowed_streams()
+        plugin._stream_overrides["dead-stream"] = "live-stream"
+
+        messages = await plugin._recent_messages("dead-stream")
+        self.assertEqual(len(messages), 1)
+        self.assertEqual([call["chat_id"] for call in ctx.message.calls], ["live-stream"])
+
+    async def test_recent_messages_empty_when_no_candidate_has_messages(self) -> None:
+        plugin, ctx = self.make_plugin(
+            all_streams=[
+                {"stream_id": "dead-stream", "group_id": self.GROUP_ID},
+                {"stream_id": "live-stream", "group_id": self.GROUP_ID},
+            ]
+        )
+        await plugin._refresh_allowed_streams()
+        ctx.message = FakeMessage(messages=[])
+        self.assertEqual(await plugin._recent_messages("dead-stream"), [])
+        self.assertNotIn("dead-stream", plugin._stream_overrides)
+
+    async def test_recent_messages_ask_host_to_skip_bot_messages(self) -> None:
+        """读聊天记录时要带 filter_mai，否则 bot 自己发的分享会污染兴趣提取。"""
+
+        now = time.time()
+        plugin, ctx = self.make_plugin()
+        ctx.message = FakeMessage(
+            messages=[{"processed_plain_text": "原神", "timestamp": str(int(now))}]
+        )
+        messages = await plugin._recent_messages("stream-1")
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(ctx.capability_calls)
+        self.assertEqual(ctx.capability_calls[0]["capability"], "message.get_recent")
+        self.assertTrue(ctx.capability_calls[0].get("filter_mai"))
+
+    async def test_own_share_messages_are_ignored(self) -> None:
+        """自己转发过的视频链接不算聊天内容。"""
+
+        now = time.time()
+        plugin, ctx = self.make_plugin()
+        ctx.message = FakeMessage(
+            messages=[
+                {
+                    "processed_plain_text": "【原神新版本测评】 https://www.bilibili.com/video/BV1xx411c7mD",
+                    "timestamp": str(int(now)),
+                },
+                {"processed_plain_text": "刚刷到一个视频 BV1yy411c7mE", "timestamp": str(int(now))},
+                {"processed_plain_text": "机械键盘真好用", "timestamp": str(int(now))},
+            ]
+        )
+        messages = await plugin._recent_messages("stream-1")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("机械键盘", messages[0]["processed_plain_text"])
+
+    async def test_bot_account_messages_are_ignored(self) -> None:
+        """宿主里登记过的 bot 账号发的消息不参与兴趣提取。"""
+
+        now = time.time()
+        plugin, ctx = self.make_plugin()
+        plugin._bot_account_ids = {"3508154517"}
+        ctx.message = FakeMessage(
+            messages=[
+                {
+                    "processed_plain_text": "小鲸鱼来啦",
+                    "timestamp": str(int(now)),
+                    "user_id": "3508154517",
+                },
+                {
+                    "processed_plain_text": "机械键盘真好用",
+                    "timestamp": str(int(now)),
+                    "user_id": "1768745505",
+                },
+            ]
+        )
+        messages = await plugin._recent_messages("stream-1")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("机械键盘", messages[0]["processed_plain_text"])
+
+    async def test_excluded_user_ids_are_ignored(self) -> None:
+        """「不参与提取的账号」里列出的账号也要跳过（用来挡第三方 bot）。"""
+
+        now = time.time()
+        plugin, ctx = self.make_plugin(
+            config=base_config(interest={"exclude_user_ids": ["1634374514"]})
+        )
+        ctx.message = FakeMessage(
+            messages=[
+                {
+                    "processed_plain_text": "那我以后少哈气一点",
+                    "timestamp": str(int(now)),
+                    "user_id": "1634374514",
+                },
+                {
+                    "processed_plain_text": "原神新版本真不错",
+                    "timestamp": str(int(now)),
+                    "user_id": "1491835202",
+                },
+            ]
+        )
+        messages = await plugin._recent_messages("stream-1")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("原神", messages[0]["processed_plain_text"])
+
+    async def test_nickname_alone_does_not_exclude_message(self) -> None:
+        """光凭昵称像 bot 不排除消息：这个启发式会误伤真人，只保留手动排除。"""
+
+        now = time.time()
+        plugin, ctx = self.make_plugin(
+            config=base_config(persona={"enabled": True, "name": "小鲸鱼"})
+        )
+        await plugin._persona.refresh()
+        ctx.message = FakeMessage(
+            messages=[
+                {
+                    "processed_plain_text": "鱼爬山那段我不承认嘛",
+                    "timestamp": str(int(now)),
+                    "user_id": "1634374514",
+                    "user_cardname": "可爱小鲸鱼",
+                },
+                {
+                    "processed_plain_text": "机械键盘真好用",
+                    "timestamp": str(int(now)),
+                    "user_id": "1768745505",
+                    "user_cardname": "火鸡味锅巴",
+                },
+            ]
+        )
+        messages = await plugin._recent_messages("stream-1")
+        self.assertEqual(len(messages), 2)
+        # 想挡掉这个账号，就把它填进 exclude_user_ids
+        plugin.set_plugin_config(
+            base_config(
+                persona={"enabled": True, "name": "小鲸鱼"},
+                interest={"exclude_user_ids": ["1634374514"]},
+            )
+        )
+        messages = await plugin._recent_messages("stream-1")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("机械键盘", messages[0]["processed_plain_text"])
+
+    def test_just_wrote_config_detects_recent_write(self) -> None:
+        """自己刚写过 config.toml 时，重载触发的启动轮要跳过。"""
+
+        plugin, _ = self.make_plugin()
+        self.assertFalse(plugin._just_wrote_config())
+        plugin._store.set_meta("last_config_write_at", time.time())
+        self.assertTrue(plugin._just_wrote_config())
+        # 保护期过了就不再跳过
+        plugin._store.set_meta("last_config_write_at", time.time() - 10_000)
+        self.assertFalse(plugin._just_wrote_config())
+
+
+class ParseTermListTests(unittest.TestCase):
+    """模型不一定严格输出 JSON，解析要尽量宽容。"""
+
+    def setUp(self) -> None:
+        lj = load_submodule("llm_judge")
+        self.parse = lj._parse_term_list
+
+    def test_plain_json_array(self) -> None:
+        self.assertEqual(self.parse('["游戏", "原神", "编程"]', 8), ["游戏", "原神", "编程"])
+
+    def test_fenced_json(self) -> None:
+        self.assertEqual(self.parse('```json\n["游戏", "原神"]\n```', 8), ["游戏", "原神"])
+
+    def test_object_wrapped(self) -> None:
+        self.assertEqual(self.parse('{"interests": ["游戏", "原神"]}', 8), ["游戏", "原神"])
+
+    def test_respects_limit(self) -> None:
+        self.assertEqual(len(self.parse('["a1", "b2", "c3", "d4"]', 2)), 2)
+
+    def test_numbered_list_fallback(self) -> None:
+        """模型没输出 JSON，而是写成编号列表时也要能捞回来。"""
+
+        text = "1. 游戏\n2. 原神\n3. 编程"
+        self.assertEqual(self.parse(text, 8), ["游戏", "原神", "编程"])
+
+    def test_bullet_list_fallback(self) -> None:
+        text = "- 机械键盘\n- 猫咪\n- 搞笑整活"
+        self.assertEqual(self.parse(text, 8), ["机械键盘", "猫咪", "搞笑整活"])
+
+    def test_quoted_terms_fallback(self) -> None:
+        text = '这些是兴趣方向：“游戏”、“原神”、“编程”'
+        terms = self.parse(text, 8)
+        self.assertIn("游戏", terms)
+        self.assertIn("原神", terms)
+
+    def test_prose_without_terms_returns_empty(self) -> None:
+        self.assertEqual(self.parse("好的，我已经理解了你的需求。", 8), [])
+
+    def test_truncated_array_still_salvages_terms(self) -> None:
+        """输出被 max_tokens 截断（缺右括号）时，已经写出的词要能捞回来。"""
+
+        text = '["游戏", "原神", "编程", "机械键'
+        terms = self.parse(text, 8)
+        self.assertIn("游戏", terms)
+        self.assertIn("原神", terms)
+
+    def test_judge_object_is_not_mistaken_for_interests(self) -> None:
+        """模型把判断结果对象当成兴趣列表返回时，别把字段名当兴趣词。"""
+
+        text = '{"relevant": true, "score": 8, "category": "社区创作"}'
+        self.assertEqual(self.parse(text, 8), [])
+
+    def test_single_char_terms_dropped_in_fallback(self) -> None:
+        text = "1. 游\n2. 原神"
+        self.assertEqual(self.parse(text, 8), ["原神"])
 
 
 if __name__ == "__main__":

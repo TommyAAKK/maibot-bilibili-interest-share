@@ -423,6 +423,27 @@ class _BilibiliClientBase:
         if self._owns_client:
             await self._client.aclose()
 
+    @property
+    def http(self) -> httpx.AsyncClient:
+        """底层 ``httpx.AsyncClient``（扫码登录等模块复用它，省掉重复连接池）。"""
+
+        return self._client
+
+    def set_cookie(self, cookie: str) -> None:
+        """更新请求头里的 Cookie（扫码登录成功后立刻生效，不用重启插件）。"""
+
+        text = (cookie or "").strip()
+        if text:
+            self._client.headers["Cookie"] = text
+        else:
+            self._client.headers.pop("Cookie", None)
+
+    @property
+    def cookie(self) -> str:
+        """当前请求头里的 Cookie。"""
+
+        return str(self._client.headers.get("Cookie") or "")
+
     async def _request_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """发请求并解析 JSON，不校验业务 ``code``。"""
 

@@ -18,6 +18,7 @@ import asyncio
 import logging
 import math
 import random
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,11 +32,29 @@ except ImportError:  # 兼容把 HookMode 只在 components 里导出的旧版�
     from maibot_sdk.components import HookMode
 
 from .bilibili import BilibiliClient, BilibiliError, Video, merge_videos
+from .bilibili_login import (
+    LoginState,
+    QrLoginError,
+    create_qrcode,
+    fetch_login_state,
+    poll_qrcode,
+    render_qrcode_png,
+)
 from .config import BilibiliInterestShareConfig
+from .config_edit import (
+    describe_write_back_state,
+    find_config_path,
+    should_write_back,
+    stream_identity,
+    update_cookie,
+    update_persona_seed_interests,
+    update_stream_auto_interests,
+)
 from .interest import (
     InterestProfile,
     ScoreResult,
     extract_interest_keywords,
+    normalize_term,
     rank_videos,
 )
 from .llm_judge import LlmJudge
@@ -50,6 +69,9 @@ PLUGIN_ID = "github.TommyAAKK.bilibili_interest_share"
 _MAX_HISTORY_ITEMS = 8
 # 白名单 stream_id 缓存时间（秒）
 _ALLOWED_STREAMS_TTL_SECONDS = 300.0
+# 自己写完 config.toml 后的保护期（秒）：这段时间内触发的重载不再跑启动轮
+_CONFIG_WRITE_GUARD_SECONDS = 180.0
+_CONFIG_WRITE_META = "last_config_write_at"
 
 
 # ----------------------------------------------------------------------
@@ -144,6 +166,55 @@ def _stream_id_of(stream: Any) -> str:
     return ""
 
 
+_BILI_URL_RE = re.compile(r"(?:bilibili\.com|b23\.tv|BV[0-9A-Za-z]{8,})", re.I)
+
+
+def _normalize_terms(values: Sequence[Any]) -> List[str]:
+    """把兴趣词归一成「去重 + 排序」的列表，用于稳定比较和写盘。"""
+
+    cleaned = {str(item).strip() for item in values if str(item or "").strip()}
+    return sorted(cleaned)
+
+
+def _message_user_id(message: Any) -> str:
+    """从消息字典里取发送者 user_id。"""
+
+    if not isinstance(message, dict):
+        return ""
+    info = message.get("message_info")
+    if isinstance(info, dict):
+        user = info.get("user_info")
+        if isinstance(user, dict):
+            value = str(user.get("user_id") or "").strip()
+            if value:
+                return value
+    for key in ("user_id", "sender_id"):
+        value = str(message.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _looks_like_own_share(message: Any) -> bool:
+    """判断一条消息是不是（自己或别人）转发的 B 站视频链接。
+
+    这类消息里全是标题、`https://www.bilibili.com/video/BV...`、「刚刷到」，
+    对「这个群喜欢什么」没有参考价值，提取兴趣时要排掉。
+    """
+
+    if not isinstance(message, dict):
+        return False
+    text = message.get("processed_plain_text") or ""
+    if not isinstance(text, str) or not text.strip():
+        text = ""
+        raw = message.get("raw_message")
+        if isinstance(raw, str):
+            text = raw
+    if not text:
+        return False
+    return bool(_BILI_URL_RE.search(text))
+
+
 def filter_messages_by_lookback(
     messages: Sequence[Dict[str, Any]], lookback_hours: float
 ) -> List[Dict[str, Any]]:
@@ -210,12 +281,22 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         self._data_dir: Optional[Path] = None
         self._allowed_stream_ids: Set[str] = set()
         self._allowed_streams_at: float = 0.0
+        # 宿主里登记过的 bot 账号（用来过滤自己 / 同类 bot 发的消息）
+        self._bot_account_ids: Set[str] = set()
         self._stream_fallbacks: Dict[str, List[str]] = {}
         self._stream_overrides: Dict[str, str] = {}
+        # 本轮攒下来的配置写回操作：写 config.toml 会让宿主重载插件、打断当前这一轮，
+        # 所以先记下来，等这一轮跑完再一次性写盘。
+        self._pending_stream_writes: Dict[str, Tuple[Any, List[str]]] = {}
+        self._pending_seed_terms: List[str] = []
         self._round_lock = asyncio.Lock()
         self.last_round: Optional[Dict[str, Any]] = None
         self.last_round_at: Optional[float] = None
         self.next_run_at: Optional[float] = None
+        # 扫码登录会话（同一时间只允许一个）
+        self._login_lock = asyncio.Lock()
+        self._login_task: Optional[asyncio.Task] = None
+        self._login_state: Optional[LoginState] = None
 
     # -- 生命周期 ------------------------------------------------------
 
@@ -237,7 +318,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
 
         self._client = BilibiliClient(
             timeout=config.advanced.request_timeout_seconds,
-            cookie=config.advanced.cookie,
+            cookie=self._effective_cookie(),
             user_agent=config.advanced.user_agent,
         )
         self._frames = FrameExtractor(
@@ -265,8 +346,10 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         )
         self._stream_fallbacks.clear()
         self._stream_overrides.clear()
+        self._bot_account_ids.clear()
         await self._persona.refresh()
         await self._refresh_allowed_streams()
+        await self._refresh_bot_account_ids()
 
         self._loop_task = asyncio.create_task(
             self._run_loop(), name="bilibili-interest-share-loop"
@@ -276,6 +359,35 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             config.schedule.interval_minutes,
             len([item for item in config.streams if item.enabled]),
         )
+        if config.account.check_on_start:
+            asyncio.create_task(
+                self._check_login_on_start(), name="bilibili-interest-share-login-check"
+            )
+
+    async def _check_login_on_start(self) -> None:
+        """启动时检查一次登录状态，Cookie 失效就提示用户去扫码。"""
+
+        if self._client is None:
+            return
+        cookie = self._effective_cookie()
+        if not cookie:
+            logger.info("麦麦刷B站：未配置 B 站 Cookie，以匿名方式访问（读不到字幕、排行榜易被风控）")
+            return
+        try:
+            state = await fetch_login_state(
+                self._client.http, cookie, user_agent=self.config.advanced.user_agent
+            )
+        except Exception as exc:  # noqa: BLE001 - 启动检查失败不影响运行
+            logger.debug("检查 B 站登录状态失败：%s", exc)
+            return
+        if state.status == "success":
+            who = state.uname or state.mid or "已登录"
+            logger.info("麦麦刷B站：B 站登录状态正常（%s）", who)
+        else:
+            logger.warning(
+                "麦麦刷B站：B 站 Cookie 可能已失效（%s），可以在聊天里发 /扫码登录 重新登录",
+                state.message,
+            )
 
     async def on_unload(self) -> None:
         task = self._loop_task
@@ -312,8 +424,10 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
     async def _run_loop(self) -> None:
         config = self.config
         interval = max(60.0, float(config.schedule.interval_minutes) * 60.0)
-        if config.schedule.run_on_start:
+        if config.schedule.run_on_start and not self._just_wrote_config():
             await self._safe_round(reason="startup")
+        elif config.schedule.run_on_start:
+            logger.info("麦麦刷B站：刚写过配置文件触发的重载，跳过启动轮，等下一个周期")
         while True:
             jitter = 0.0
             if config.schedule.jitter_seconds > 0:
@@ -325,6 +439,19 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             except asyncio.CancelledError:
                 return
             await self._safe_round(reason="scheduled")
+
+    def _just_wrote_config(self) -> bool:
+        """刚由插件自己写过 config.toml 吗（写入会触发宿主重载，避免重载后再跑一轮）。"""
+
+        if self._store is None:
+            return False
+        try:
+            stamp = float(self._store.get_meta(_CONFIG_WRITE_META, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if stamp <= 0.0:
+            return False
+        return time.time() - stamp < _CONFIG_WRITE_GUARD_SECONDS
 
     async def _safe_round(self, *, reason: str) -> None:
         try:
@@ -366,6 +493,14 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 except Exception as exc:  # noqa: BLE001 - 人设读不到就用中性语气
                     logger.debug("刷新人设失败：%s", exc)
             await self._ensure_allowed_streams()
+            if not self._bot_account_ids:
+                await self._refresh_bot_account_ids()
+            # 「人设初始兴趣」是通用配置：没有就按人设生成一次（轮末写回配置）
+            if not self._configured_persona_seed():
+                try:
+                    await self._ensure_persona_seed_interests()
+                except Exception as exc:  # noqa: BLE001 - 生成失败不影响正常分享
+                    logger.debug("生成人设初始兴趣失败：%s", exc)
             resolved: List[Tuple[Any, str, InterestProfile]] = []
             for target in targets:
                 stream_id = await self._resolve_stream(target)
@@ -378,6 +513,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                     continue
                 resolved.append((target, stream_id, profile))
             if not resolved:
+                self._flush_pending_config_writes()
                 return {
                     "ok": True,
                     "skipped": "no_stream",
@@ -427,6 +563,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 {key: value for key, value in summary.items() if key != "bvids"}
             )
             self._store.save()
+            # 这一轮彻底跑完，再把攒下的配置写回落盘（避免写文件触发重载打断本轮）
+            self._flush_pending_config_writes()
             return summary
 
     async def _process_target(
@@ -810,6 +948,21 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         getter = getattr(config_cap, "get", None)
         return getter if callable(getter) else None
 
+    def _effective_cookie(self) -> str:
+        """当前生效的 B 站 Cookie：优先「账号登录」里的，其次旧版「高级」里的。"""
+
+        config = self.config
+        account = getattr(config, "account", None)
+        cookie = str(getattr(account, "cookie", "") or "").strip()
+        if cookie:
+            return cookie
+        return str(getattr(config.advanced, "cookie", "") or "").strip()
+
+    def _config_file(self) -> Path:
+        """插件自己的 ``config.toml`` 路径。"""
+
+        return find_config_path(Path(__file__).resolve().parent)
+
     async def _refresh_allowed_streams(self) -> Set[str]:
         """解析白名单里所有启用的会话，缓存可用的 stream_id 集合。
 
@@ -830,6 +983,32 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         self._allowed_stream_ids = allowed
         self._allowed_streams_at = time.time()
         return allowed
+
+    async def _refresh_bot_account_ids(self) -> Set[str]:
+        """收集宿主里登记过的 bot 账号 id，用来过滤 bot 自己发的消息。"""
+
+        chat = getattr(self.ctx, "chat", None)
+        getter = getattr(chat, "get_all_streams", None) if chat is not None else None
+        if not callable(getter):
+            return self._bot_account_ids
+        try:
+            result = await getter("qq")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("枚举全部会话（收集 bot 账号）失败：%s", exc)
+            return self._bot_account_ids
+        streams = result.get("streams") if isinstance(result, dict) else result
+        if not isinstance(streams, list):
+            return self._bot_account_ids
+        found: Set[str] = set()
+        for item in streams:
+            if not isinstance(item, dict):
+                continue
+            account_id = str(item.get("account_id") or "").strip()
+            if account_id:
+                found.add(account_id)
+        if found:
+            self._bot_account_ids = found
+        return self._bot_account_ids
 
     async def _ensure_allowed_streams(self) -> Set[str]:
         """白名单集合为空或过期时重新解析。"""
@@ -870,6 +1049,9 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         for item in streams:
             if not isinstance(item, dict):
                 continue
+            account_id = str(item.get("account_id") or "").strip()
+            if account_id:
+                self._bot_account_ids.add(account_id)
             stream_id = _stream_id_of(item)
             if not stream_id:
                 continue
@@ -920,7 +1102,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
         return primary
 
     async def _build_profile(self, target: Any, stream_id: str) -> InterestProfile:
-        """构建会话兴趣画像：配置里的显式兴趣 + 近期聊天关键词。"""
+        """构建会话兴趣画像：配置里的显式兴趣 + 近期聊天关键词 + 人设初始兴趣。"""
 
         config = self.config
         profile = InterestProfile()
@@ -929,6 +1111,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             if normalized:
                 profile.add(normalized, config.interest.explicit_weight)
 
+        auto_terms: List[str] = []
         if config.interest.use_recent_chat and target.auto_interest:
             messages = await self._recent_messages(stream_id)
             keywords = extract_interest_keywords(
@@ -937,35 +1120,297 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 min_count=config.interest.keyword_min_count,
                 extra_stopwords=config.interest.extra_stopwords,
             )
+            persona_noise = self._persona_noise_terms()
             for term, count in keywords:
+                if self._is_persona_noise(term, persona_noise):
+                    # 群里叫 bot 的名字 / 别名不是「群的兴趣」，写回配置只会是噪音
+                    continue
                 weight = config.interest.auto_weight * min(
                     2.0, 0.6 + 0.4 * math.log2(1 + count)
                 )
                 profile.add(term, weight)
+                auto_terms.append(term)
+            if auto_terms:
+                await self._persist_auto_interests(target, auto_terms)
+
+        # 配置里已有自动兴趣（上一轮写回的），也参与打分
+        for term in getattr(target, "auto_interests", None) or []:
+            normalized = (term or "").strip()
+            if normalized and not profile.has(normalized):
+                profile.add(normalized, config.interest.auto_weight)
+
+        # 一点兴趣都没有（既没手写、聊天里也提不出）→ 用通用的人设初始兴趣兜底
+        if not profile.sorted_terms():
+            seed = await self._ensure_persona_seed_interests()
+            for term in seed:
+                profile.add(term, config.interest.auto_weight)
         return profile
 
-    async def _recent_messages(self, stream_id: str) -> List[Dict[str, Any]]:
-        message_cap = getattr(self.ctx, "message", None)
-        if message_cap is None:
-            return []
-        config = self.config
+    def _persona_noise_terms(self) -> Set[str]:
+        """人设名字与别名：群里喊 bot 的称呼不算「群的兴趣」。"""
+
+        names: Set[str] = set()
+        if self._persona is None:
+            return names
         try:
-            # 宿主 SDK 的 get_recent 只接受 chat_id / limit，时间窗需要自己过滤。
-            result = await message_cap.get_recent(
-                chat_id=stream_id,
-                limit=int(config.interest.max_messages_per_stream),
+            persona = self._persona.get()
+        except Exception:  # noqa: BLE001 - 人设读不到就不做过滤
+            return names
+        if persona is None:
+            return names
+        raw_values = [getattr(persona, "name", "")]
+        raw_values.extend(getattr(persona, "aliases", None) or [])
+        for value in raw_values:
+            normalized = normalize_term(str(value or ""))
+            if normalized:
+                names.add(normalized)
+        return names
+
+    @staticmethod
+    def _is_persona_noise(term: str, noise: Set[str]) -> bool:
+        """判断关键词是不是在喊 bot（人设名 / 别名）。"""
+
+        normalized = normalize_term(str(term or ""))
+        if not normalized:
+            return True
+        for item in noise:
+            if not item:
+                continue
+            if normalized == item:
+                return True
+            # 太短的别名（单字）不做包含匹配，否则「鱼」会把「钓鱼」也误杀
+            if len(item) >= 2 and (normalized in item or item in normalized):
+                return True
+        return False
+
+    async def _persist_auto_interests(self, target: Any, terms: Sequence[str]) -> None:
+        """把自动提取的兴趣记到待写队列，轮末再写回 ``config.toml``。
+
+        用户手动改过就不再覆盖（相当于锁定）；清空则恢复自动维护。
+        这里刻意不立刻写盘：宿主的 ``config.toml`` 一变就会重新加载插件，
+        重新加载会把正在跑的这一轮直接打断（连分享都来不及发）。
+        """
+
+        config = self.config
+        if not config.interest.persist_auto_interests or self._store is None:
+            return
+        key = stream_identity(target)
+        if not key:
+            return
+        current = list(getattr(target, "auto_interests", None) or [])
+        last_written = self._store.get_auto_interests(key)
+        if not should_write_back(current, last_written):
+            return
+        cleaned = _normalize_terms(terms)
+        # 词的先后顺序每轮可能不一样，按「集合」比较，避免内容没变却反复写盘
+        if cleaned == _normalize_terms(current):
+            return
+        self._pending_stream_writes[key] = (target, cleaned)
+        # 同步内存里的配置对象，本轮立刻生效（宿主不会因为文件变化重新加载配置）
+        try:
+            target.auto_interests = list(cleaned)
+        except Exception:  # noqa: BLE001 - pydantic 模型通常是可写的
+            pass
+
+    async def _persona_seed_interests(self) -> List[str]:
+        """还没有任何兴趣时，让 LLM 按 MaiBot 人设生成一份初始兴趣。"""
+
+        config = self.config
+        if not config.interest.persona_seed_enabled:
+            return []
+        if self._judge is None or not config.interest.use_llm_judge:
+            logger.info(
+                "跳过「人设初始兴趣」生成：需要同时开启 use_llm_judge 与 persona_seed_enabled"
+            )
+            return []
+        persona_block = ""
+        if self._persona is not None:
+            try:
+                persona_block = self._persona.prompt_block()
+            except Exception:  # noqa: BLE001
+                persona_block = ""
+        try:
+            return await self._judge.seed_interests(
+                persona_block=persona_block,
+                count=int(config.interest.persona_seed_count),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("读取会话 %s 近期消息失败：%s", stream_id, exc)
+            logger.warning("用人设生成初始兴趣失败：%s", exc)
             return []
+
+    def _configured_persona_seed(self) -> List[str]:
+        """配置里已有的「人设初始兴趣」（空列表表示还没有）。"""
+
+        return [
+            str(item).strip()
+            for item in (self.config.interest.persona_seed_interests or [])
+            if str(item or "").strip()
+        ]
+
+    async def _ensure_persona_seed_interests(self) -> List[str]:
+        """取「人设初始兴趣」这个通用配置；没有就按人设生成一份并写回配置。"""
+
+        configured = self._configured_persona_seed()
+        if configured:
+            return configured
+        seed = await self._persona_seed_interests()
+        if seed:
+            logger.info("已按人设生成初始兴趣：%s", "、".join(seed))
+            self._persist_persona_seed_interests(seed)
+        else:
+            logger.info("还没有「人设初始兴趣」，本次按人设生成失败，下一轮再试")
+        return seed
+
+    def _persist_persona_seed_interests(self, terms: Sequence[str]) -> None:
+        """把人设初始兴趣记到待写队列，轮末再写回 ``[interest].persona_seed_interests``。"""
+
+        cleaned = [str(item).strip() for item in terms if str(item or "").strip()]
+        if not cleaned:
+            return
+        self._pending_seed_terms = list(cleaned)
+        # 同步内存里的配置对象，本轮立刻生效
+        try:
+            self.config.interest.persona_seed_interests = list(cleaned)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _flush_pending_config_writes(self) -> None:
+        """把本轮攒下的配置写回一次性落盘（放在轮末，避免打断当前这一轮）。"""
+
+        if self._store is None:
+            self._pending_stream_writes.clear()
+            self._pending_seed_terms = []
+            return
+        if not self._pending_stream_writes and not self._pending_seed_terms:
+            return
+        path = self._config_file()
+        wrote = False
+        for key, (target, cleaned) in list(self._pending_stream_writes.items()):
+            if update_stream_auto_interests(path, target, cleaned):
+                self._store.set_auto_interests(key, cleaned)
+                wrote = True
+                logger.info(
+                    "已把自动兴趣写回配置（%s）：%s",
+                    getattr(target, "name", "") or key,
+                    "、".join(cleaned),
+                )
+        if self._pending_seed_terms and update_persona_seed_interests(
+            path, self._pending_seed_terms
+        ):
+            wrote = True
+            logger.info(
+                "已把人设初始兴趣写回配置：%s", "、".join(self._pending_seed_terms)
+            )
+        self._pending_stream_writes.clear()
+        self._pending_seed_terms = []
+        if not wrote:
+            return
+        # 记下「我们自己刚写过配置文件」：宿主的 config.toml 一变就会重新加载插件，
+        # 重新加载又会跑一次启动轮，很容易变成「写配置 → 重载 → 又跑一轮 → 又写」的循环。
+        self._store.set_meta(_CONFIG_WRITE_META, time.time())
+        self._store.save()
+
+    async def _recent_messages(self, stream_id: str) -> List[Dict[str, Any]]:
+        """读取会话近期消息；主会话读不到就换同群/同用户的候选会话再试。
+
+        宿主换连接器后，同一个群可能同时挂着旧账号的会话和新账号的会话，
+        能力接口返回的往往是已经掉线的旧会话——它的消息停留在换账号之前，
+        按 ``lookback_hours`` 过滤后是空的，会导致自动兴趣永远提不出来。
+        这里按「记住的可用会话 → 主会话 → 其余候选」的顺序找第一个有消息的。
+        """
+
+        message_cap = getattr(self.ctx, "message", None)
+        if message_cap is None or not stream_id:
+            return []
+        config = self.config
+        primary = self._stream_overrides.get(stream_id, stream_id)
+        candidates = [primary, stream_id]
+        candidates.extend(self._stream_fallbacks.get(stream_id, ()) or ())
+        tried: List[str] = []
+        for candidate in candidates:
+            if not candidate or candidate in tried:
+                continue
+            tried.append(candidate)
+            messages = await self._recent_messages_of(message_cap, candidate)
+            if messages:
+                if candidate != stream_id and self._stream_overrides.get(stream_id) != candidate:
+                    # 记住这个会话有消息，后续发送也优先用它
+                    self._stream_overrides[stream_id] = candidate
+                    logger.info(
+                        "会话 %s 没有近期消息，改从候选会话 %s 读取聊天记录",
+                        stream_id,
+                        candidate,
+                    )
+                return messages
+        return []
+
+    async def _recent_messages_of(
+        self, message_cap: Any, chat_id: str
+    ) -> List[Dict[str, Any]]:
+        """从指定会话读取近期消息（已按 ``lookback_hours`` 过滤）。
+
+        读取时会尽量带上 ``filter_mai=True``：bot 自己发的分享消息里有大量
+        「https://www.bilibili.com/video/BV...」「刚刷到」这类字样，混进兴趣提取
+        里只会变成噪音。SDK 的 ``message.get_recent`` 没暴露这个参数，所以优先
+        直接走 ``call_capability``，拿不到再退回普通调用。
+        """
+
+        config = self.config
+        limit = int(config.interest.max_messages_per_stream)
+        result = None
+        call_capability = getattr(self.ctx, "call_capability", None)
+        if callable(call_capability):
+            try:
+                result = await call_capability(
+                    "message.get_recent",
+                    chat_id=chat_id,
+                    limit=limit,
+                    filter_mai=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - 老宿主可能不认这个参数
+                logger.debug("带 filter_mai 读取会话 %s 消息失败，改用普通读取：%s", chat_id, exc)
+                result = None
+        if result is None:
+            try:
+                # 宿主 SDK 的 get_recent 只接受 chat_id / limit，时间窗需要自己过滤。
+                result = await message_cap.get_recent(chat_id=chat_id, limit=limit)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取会话 %s 近期消息失败：%s", chat_id, exc)
+                return []
         if isinstance(result, dict):
             messages = result.get("messages")
             messages = list(messages) if isinstance(messages, list) else []
         else:
             messages = list(result or [])
+        messages = [item for item in messages if not self._is_ignored_message(item)]
         return filter_messages_by_lookback(
             messages, float(config.interest.lookback_hours)
         )
+
+    def _is_ignored_message(self, message: Any) -> bool:
+        """这条消息要不要排除在兴趣提取之外。
+
+        排除三类：自己发的消息、转发的 B 站视频链接、
+        以及用户在「不参与提取的账号」里列出的账号。
+
+        其他 bot 不做自动识别：昵称里带人设名字这类启发式太容易误伤真人，
+        所以只保留 ``exclude_user_ids`` 这个手动开关。
+        """
+
+        if not isinstance(message, dict):
+            return True
+        if _looks_like_own_share(message):
+            return True
+        user_id = _message_user_id(message)
+        if not user_id:
+            return False
+        if user_id in self._bot_account_ids:
+            return True
+        config = self.config
+        excluded = {
+            str(item).strip() for item in (config.interest.exclude_user_ids or []) if str(item or "").strip()
+        }
+        return user_id in excluded
 
     def _collect_search_keywords(self, profiles: Sequence[InterestProfile]) -> List[str]:
         """按出现频次从各会话画像里挑出本轮搜索关键词。"""
@@ -1031,6 +1476,58 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 if not result.get("success"):
                     logger.warning(
                         "发送消息失败（%s）：%s", stream_id, result.get("error") or result
+                    )
+                    return False
+                return True
+            return True
+        return bool(result)
+
+    async def _send_image(self, stream_id: str, png_bytes: bytes) -> bool:
+        """发送一张 PNG 图片（base64 交给宿主的 ``send.image``）。
+
+        和文本一样，失败时会换用同群的其他候选会话重试。
+        """
+
+        if not png_bytes or not stream_id:
+            return False
+        import base64
+
+        payload = base64.b64encode(png_bytes).decode("ascii")
+        primary = self._stream_overrides.get(stream_id, stream_id)
+        if await self._send_image_once(primary, payload):
+            return True
+        for alternative in self._stream_fallbacks.get(stream_id, ()) or ():
+            if alternative == primary:
+                continue
+            if await self._send_image_once(alternative, payload):
+                self._stream_overrides[stream_id] = alternative
+                return True
+        return False
+
+    async def _send_image_once(self, stream_id: str, image_base64: str) -> bool:
+        """向指定会话发送一张图片（原始 base64，不带 data URI 前缀）。"""
+
+        if not image_base64 or not stream_id:
+            return False
+        send = getattr(self.ctx, "send", None)
+        if send is None:
+            return False
+        sender = getattr(send, "image", None)
+        if not callable(sender):
+            logger.debug("宿主没有 send.image 能力，无法发送图片")
+            return False
+        try:
+            result = await sender(image_base64, stream_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送图片失败（%s）：%s", stream_id, exc)
+            return False
+        if isinstance(result, dict):
+            if "sent" in result:
+                return bool(result.get("sent"))
+            if "success" in result:
+                if not result.get("success"):
+                    logger.warning(
+                        "发送图片失败（%s）：%s", stream_id, result.get("error") or result
                     )
                     return False
                 return True
@@ -1350,6 +1847,133 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             await self._send_text(stream_id, "好嘞，再发一遍～")
         logger.info("按用户要求重发了 %s（%s）", video.bvid, video.title)
 
+    @Command(
+        "bili_login",
+        description="扫码登录 B 站（仅私聊可用；手机扫码后自动保存 Cookie）",
+        pattern=r"^/扫码登录\s*$",
+        aliases=["/bili-login", "/扫码登陆"],
+    )
+    async def cmd_login(self, **kwargs: Any) -> Tuple[bool, str, int]:
+        # 扫码登录只在私聊里开放：群里发二维码容易被别人扫走，也容易刷屏
+        group_id = str(kwargs.get("group_id") or "").strip()
+        if group_id:
+            text = "扫码登录只能在私聊里用哦，群里发二维码不安全。私聊我发 /扫码登录 就行。"
+            return True, text, 2
+        stream_id = _stream_id_of(kwargs)
+        if self._client is None:
+            text = "插件还没加载完成，稍等一下再试。"
+            if stream_id:
+                await self._send_text(stream_id, text)
+            return True, text, 2
+        if self._login_task is not None and not self._login_task.done():
+            text = "已经有一个扫码登录在进行中，先看看刚才那条消息吧。"
+            if stream_id:
+                await self._send_text(stream_id, text)
+            return True, text, 2
+        if not stream_id:
+            text = "扫码登录需要在一个聊天里发起。"
+            return True, text, 2
+        text = "正在生成登录二维码…"
+        self._login_task = asyncio.create_task(
+            self._run_qr_login(stream_id), name="bilibili-interest-share-qr-login"
+        )
+        return True, text, 2
+
+    async def _run_qr_login(self, stream_id: str) -> None:
+        """生成二维码 → 发图 → 轮询到成功或超时。"""
+
+        config = self.config
+        client = self._client
+        if client is None:
+            return
+        timeout = float(config.account.qrcode_timeout_seconds)
+        try:
+            session = await create_qrcode(
+                client.http, user_agent=config.advanced.user_agent
+            )
+        except QrLoginError as exc:
+            await self._send_text(stream_id, f"生成登录二维码失败：{exc}")
+            return
+        try:
+            png = render_qrcode_png(session.url)
+        except QrLoginError as exc:
+            await self._send_text(
+                stream_id,
+                f"二维码图片生成失败（{exc}），请直接打开这个链接登录：{session.url}",
+            )
+            return
+        sent = await self._send_image(stream_id, png)
+        if not sent:
+            await self._send_text(
+                stream_id,
+                f"二维码图片发送失败，请直接打开这个链接登录：{session.url}",
+            )
+            return
+        await self._send_text(
+            stream_id,
+            f"请用 B 站手机客户端扫码登录，{int(timeout)} 秒内有效。"
+            "登录成功后会自动保存 Cookie，不用手动复制。",
+        )
+
+        deadline = time.time() + timeout
+        last_status = "waiting"
+        while time.time() < deadline:
+            await asyncio.sleep(2.0)
+            state = await poll_qrcode(
+                client.http, session.qrcode_key, user_agent=config.advanced.user_agent
+            )
+            self._login_state = state
+            if state.status == "success":
+                await self._apply_login_cookie(state.cookie, stream_id)
+                return
+            if state.status == "expired":
+                await self._send_text(stream_id, "二维码已失效，重新发一次 /扫码登录 吧。")
+                return
+            if state.status == "scanned" and last_status != "scanned":
+                last_status = "scanned"
+                await self._send_text(stream_id, "已扫码，请在手机上点一下确认登录。")
+            elif state.status == "error":
+                logger.debug("轮询登录状态出错：%s", state.message)
+        await self._send_text(stream_id, "等待扫码超时了，需要的话再发一次 /扫码登录。")
+
+    async def _apply_login_cookie(self, cookie: str, stream_id: str) -> None:
+        """扫码成功：保存 Cookie 到配置、立刻生效、回报用户。"""
+
+        cookie = (cookie or "").strip()
+        if not cookie:
+            await self._send_text(stream_id, "登录成功了，但没取到 Cookie，请再试一次。")
+            return
+        if self._client is not None:
+            self._client.set_cookie(cookie)
+        # 同步内存里的配置（宿主不会因为 config.toml 变化而重新加载）
+        try:
+            self.config.account.cookie = cookie
+        except Exception:  # noqa: BLE001
+            pass
+        saved = update_cookie(self._config_file(), cookie)
+        # 校验一下并拿到昵称
+        who = ""
+        if self._client is not None:
+            try:
+                state = await fetch_login_state(
+                    self._client.http, cookie, user_agent=self.config.advanced.user_agent
+                )
+                if state.status == "success":
+                    who = state.uname or state.mid or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("校验登录状态失败：%s", exc)
+        name_part = f"（{who}）" if who else ""
+        if saved:
+            text = f"登录成功{name_part}，Cookie 已经保存到配置里了，之后就能读字幕、排行榜也更稳。"
+        else:
+            text = (
+                f"登录成功{name_part}，但 Cookie 写入配置文件失败，"
+                "请把日志里的 Cookie 手动填到「账号登录」里。"
+            )
+            logger.warning("B 站 Cookie（请手动填入配置）：%s", cookie)
+        await self._send_text(stream_id, text)
+        logger.info("B 站扫码登录成功%s", name_part)
+
     # -- 指令 ----------------------------------------------------------
 
     @Command(
@@ -1481,10 +2105,14 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             f"白名单会话：{len([item for item in config.streams if item.enabled])} 个",
             f"LLM 判断：{'开' if config.interest.use_llm_judge else '关'}（{config.interest.llm_task_name}）",
             f"抽帧识图：{'开' if config.vision.enabled else '关'}（{config.vision.task_name}）",
+            self._account_desc(),
         ]
         persona_desc = self._persona_desc()
         if persona_desc:
             lines.append(persona_desc)
+        interest_lines = self._interest_desc()
+        if interest_lines:
+            lines.extend(interest_lines)
         if self.next_run_at:
             remain = max(0, int(self.next_run_at - time.time()))
             lines.append(f"下一轮：约 {remain // 60} 分 {remain % 60} 秒后")
@@ -1494,6 +2122,49 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 f"已记录视频：{stats.get('seen_count', 0)} 个，累计分享：{stats.get('total_shared', 0)} 次"
             )
         return "\n".join(lines)
+
+    def _account_desc(self) -> str:
+        """状态里显示 B 站登录情况。"""
+
+        cookie = self._effective_cookie()
+        if not cookie:
+            return "B 站登录：未登录（匿名访问，读不到字幕；发 /扫码登录 可以扫码登录）"
+        state = self._login_state
+        if state is not None and state.status == "success":
+            who = state.uname or state.mid
+            return f"B 站登录：已登录{f'（{who}）' if who else ''}"
+        return "B 站登录：已配置 Cookie（发 /扫码登录 可重新登录）"
+
+    def _interest_desc(self) -> List[str]:
+        """状态里列出各白名单会话的兴趣，方便确认自动提取有没有生效。"""
+
+        config = self.config
+        targets = [item for item in config.streams if item.enabled]
+        if not targets:
+            return []
+        lines: List[str] = []
+        for target in targets[:5]:
+            label = getattr(target, "name", "") or getattr(target, "group_id", "") or getattr(
+                target, "user_id", ""
+            ) or getattr(target, "stream_id", "")
+            manual = [str(item).strip() for item in (target.interests or []) if str(item or "").strip()]
+            auto = [str(item).strip() for item in (getattr(target, "auto_interests", None) or []) if str(item or "").strip()]
+            parts = [f"【{label or '未命名会话'}】"]
+            if manual:
+                parts.append(f"手写：{'、'.join(manual)}")
+            if auto:
+                parts.append(f"自动：{'、'.join(auto)}")
+            if not manual and not auto:
+                parts.append("暂无兴趣（下一轮会按人设生成初始兴趣）")
+            if self._store is not None:
+                key = stream_identity(target)
+                last_written = self._store.get_auto_interests(key) if key else None
+                if auto:
+                    parts.append(describe_write_back_state(auto, last_written))
+            lines.append("；".join(parts))
+        if len(targets) > 5:
+            lines.append(f"…另有 {len(targets) - 5} 个会话未显示")
+        return lines
 
     def _persona_desc(self) -> str:
         """状态里显示当前人设来源。"""
@@ -1551,6 +2222,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             tag_weight=config.interest.tag_weight,
         )
         if not results:
+            self._flush_pending_config_writes()
             return f"候选 {len(videos)} 个，但没有视频通过过滤与打分阈值。"
         lines = [f"候选 {len(videos)} 个，前 5 名："]
         for index, result in enumerate(results[:5], 1):
@@ -1559,6 +2231,7 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             lines.append(
                 f"{index}. {video.title}（{result.score:.1f} 分｜{video.play} 播放｜匹配：{matched}）"
             )
+        self._flush_pending_config_writes()
         return "\n".join(lines)
 
     # -- 杂项 ----------------------------------------------------------

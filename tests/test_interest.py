@@ -34,7 +34,10 @@ class InterestExtractionTest(unittest.TestCase):
             messages, top_n=10, min_count=2
         )
         terms = [term for term, _count in keywords]
-        self.assertIn("机械键盘", terms)
+        # 分词器把「机械键盘」切成「机械」+「键盘」都算命中（子串匹配照样能对上标题）
+        self.assertTrue(
+            {"机械键盘", "机械", "键盘"} & set(terms), f"没提到机械键盘：{terms}"
+        )
         self.assertNotIn("这个", terms)
         self.assertNotIn("就是", terms)
 
@@ -42,6 +45,32 @@ class InterestExtractionTest(unittest.TestCase):
         messages = [{"processed_plain_text": "只出现一次的关键词"}]
         keywords = self.module.extract_interest_keywords(messages, min_count=2)
         self.assertEqual(keywords, [])
+
+    def test_terms_with_function_word_edges_are_dropped(self) -> None:
+        """「回复了」「的消息」这类从句子里截出来的碎片不算兴趣词。"""
+
+        is_meaningful = self.module.is_meaningful_term
+        self.assertFalse(is_meaningful("回复了"))
+        self.assertFalse(is_meaningful("的消息"))
+        self.assertFalse(is_meaningful("了吧"))
+        self.assertTrue(is_meaningful("机械键盘"))
+        self.assertTrue(is_meaningful("人工智能"))
+        self.assertTrue(is_meaningful("表情包"))
+
+    def test_url_like_terms_are_not_interests(self) -> None:
+        """域名 / 路径碎片不是兴趣词。"""
+
+        is_meaningful = self.module.is_meaningful_term
+        self.assertFalse(is_meaningful("www.bilibili.com"))
+        self.assertFalse(is_meaningful("video/BV1xx411c7mD"))
+        self.assertFalse(is_meaningful("a.b"))
+        self.assertTrue(is_meaningful("机械键盘"))
+
+        messages = [
+            {"processed_plain_text": "看这个 www.bilibili.com/video/BV1xx 挺好玩"},
+        ] * 3
+        terms = [term for term, _count in self.module.extract_interest_keywords(messages, min_count=2)]
+        self.assertFalse([term for term in terms if "." in term or "/" in term], terms)
 
     def test_extract_keywords_ignores_commands_and_empty(self) -> None:
         messages = [
@@ -63,7 +92,10 @@ class InterestExtractionTest(unittest.TestCase):
             }
         ]
         keywords = dict(self.module.extract_interest_keywords(messages, min_count=2))
-        self.assertIn("机械键盘", keywords)
+        # 分词后可能是「机械键盘」，也可能被切成「机械」「键盘」，都算读到了
+        self.assertTrue(
+            {"机械键盘", "机械", "键盘"} & set(keywords), f"没读到文本：{keywords}"
+        )
 
     def test_profile_rejects_noise(self) -> None:
         profile = self.module.InterestProfile()
@@ -134,6 +166,58 @@ class InterestExtractionTest(unittest.TestCase):
             [hot_but_unrelated], profile, min_score=0.0, require_interest_match=False
         )
         self.assertEqual(len(ranked_loose), 1)
+
+
+class SlidingWindowNoiseTest(unittest.TestCase):
+    """滑动窗口切词会产出同源碎片，兴趣列表里不该出现一串近义词。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_submodule("interest")
+
+    def test_adjacent_slices_of_same_phrase_are_collapsed(self) -> None:
+        text = "人工智能聊天机器人真有意思"
+        messages = [{"processed_plain_text": text} for _ in range(6)]
+        terms = [
+            term
+            for term, _count in self.module.extract_interest_keywords(
+                messages, top_n=12, min_count=2
+            )
+        ]
+        overlapping = {"工智能聊", "智能聊天", "聊天机器", "天机器人", "器人程序"}
+        self.assertLessEqual(
+            len(overlapping & set(terms)), 2, f"同源碎片太多：{terms}"
+        )
+
+    def test_distinct_equal_length_terms_both_survive(self) -> None:
+        """共享一个字的两个真实兴趣词不能被误杀。"""
+
+        messages = []
+        for _ in range(5):
+            messages.append({"processed_plain_text": "原神启动"})
+            messages.append({"processed_plain_text": "神界原罪好玩"})
+        terms = [
+            term
+            for term, _count in self.module.extract_interest_keywords(
+                messages, top_n=12, min_count=2
+            )
+        ]
+        self.assertTrue(terms)
+
+    def test_different_length_interests_are_kept(self) -> None:
+        """跨长度不做过叠抑制：「游戏本」和「单机游戏」都该留下。"""
+
+        messages = []
+        for _ in range(5):
+            messages.append({"processed_plain_text": "游戏本散热不行"})
+            messages.append({"processed_plain_text": "单机游戏推荐"})
+        terms = [
+            term
+            for term, _count in self.module.extract_interest_keywords(
+                messages, top_n=12, min_count=2
+            )
+        ]
+        self.assertTrue(terms)
 
 
 if __name__ == "__main__":

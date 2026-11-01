@@ -36,12 +36,23 @@ STOPWORDS = {
     "完了", "好的", "行吧", "算了", "没事", "有点", "好像", "估计", "大概", "反正",
     "以及", "关于", "对于", "通过", "根据", "比如", "例如", "另外", "此外", "同时",
     "the", "and", "for", "you", "are", "this", "that", "with", "have", "not",
+    # 聊天里高频但没有兴趣含义的词（真实群聊里提取出来会污染兴趣画像）
+    "用户", "主人", "消息", "系统", "机器人", "图片", "表情", "链接", "文件",
+    "语音", "视频", "直播", "群友", "群主", "管理", "管理员", "记得", "刚才",
+    "等下", "晚点", "明天", "昨天", "早上", "中午", "晚上", "先", "再看",
+    "https", "http", "www", "com", "cn", "html", "jpeg", "jpg", "png", "gif",
+    "qq", "ww", "hhh", "hh", "233", "2333", "awa", "qwq", "orz", "lol",
+    "哔哩", "bilibili", "b站", "阿b", "up", "up主",
 }
 
 # 单字停用字：一个 n-gram 如果全部由这些字组成，也丢弃
 _SINGLE_STOP_CHARS = set(
     "的了吗呢吧啊哦嗯是在有我你他她它们这那个就都也还和与及或但不没很太又要会能可对说道着过被把让给从向以于为之其而且所如果因为所以然后什么怎么可以没有我们你们他们自己时候东西知道觉得已经有点比较可能应该其实这样那样这么那么一些这种那种问题哈"
 )
+
+# 虚词：出现在 n-gram 的开头或结尾，说明它只是从一句话里截下来的碎片。
+# 只放几乎不会作为名词首尾的字（「能」「会」「对」「为」这类会误杀「智能」「机会」「绝对」「行为」）。
+_EDGE_STOP_CHARS = set("的了吗呢吧啊哦嗯")
 
 
 def normalize_term(term: str) -> str:
@@ -65,21 +76,35 @@ def is_meaningful_term(term: str, extra_stopwords: Optional[Iterable[str]] = Non
         return False
     if normalized.isdigit():
         return False
+    # URL / 域名 / 路径碎片（www.bilibili.com、video/BV...）不是兴趣
+    if any(ch in normalized for ch in "./:@#?=&%+"):
+        return False
     if normalized in STOPWORDS:
         return False
     if extra_stopwords and normalized in {normalize_term(w) for w in extra_stopwords if w}:
         return False
     if all(ch in _SINGLE_STOP_CHARS for ch in normalized):
         return False
+    # 以虚词开头/结尾的多半是「回复了」「的消息」这类从句子里截出来的碎片
+    if normalized[0] in _EDGE_STOP_CHARS or normalized[-1] in _EDGE_STOP_CHARS:
+        return False
     return True
 
 
 def iter_terms(text: str) -> Iterable[str]:
-    """把一段文本拆成候选兴趣词（中文 2~4-gram + 英文单词）。"""
+    """把一段文本拆成候选兴趣词（优先用 jieba 分词，退化为中文 n-gram + 英文单词）。"""
 
     if not text:
         return
     lowered = text.lower()
+    if _jieba_available():
+        for word in _segment_cjk(lowered):
+            yield word
+        for word in _LATIN_RE.findall(lowered):
+            if word.isdigit():
+                continue
+            yield word
+        return
     for run in _CJK_RUN_RE.findall(lowered):
         length = len(run)
         for size in (2, 3, 4):
@@ -94,6 +119,58 @@ def iter_terms(text: str) -> Iterable[str]:
         if word.isdigit():
             continue
         yield word
+
+
+# 能当兴趣词保留的中文词性：名词类 + 英文。其余（动词/副词/虚词/数词）多半是
+# 「回复」「觉得」「真的」这种口语碎片。
+_KEEP_POS_PREFIXES = ("n", "eng", "vn", "an", "j", "l", "i", "nz", "nt", "nr")
+
+_JIEBA_PSEG: Any = None
+_JIEBA_FAILED = False
+
+
+def _jieba_available() -> bool:
+    """宿主环境装没装 jieba（装了就用分词，比 n-gram 干净得多）。"""
+
+    global _JIEBA_PSEG, _JIEBA_FAILED
+    if _JIEBA_PSEG is not None:
+        return True
+    if _JIEBA_FAILED:
+        return False
+    try:
+        import jieba.posseg as pseg  # type: ignore[import-not-found]
+
+        _JIEBA_PSEG = pseg
+        return True
+    except Exception:  # noqa: BLE001 - 没有 jieba 就退回 n-gram
+        _JIEBA_FAILED = True
+        return False
+
+
+def _segment_cjk(text: str) -> List[str]:
+    """用 jieba 分词，只保留名词类词（不做相邻词拼接）。
+
+    拼复合词看着更「像兴趣」（「机械键盘」），但会让基础词被包含规则吃掉：
+    「原神」被「原神版本」压掉之后，标题叫「原神攻略」的视频就匹配不上了，
+    召回反而变差。单词匹配是按子串找的，「机械」照样能命中「机械键盘评测」。
+    """
+
+    if _JIEBA_PSEG is None:
+        return []
+    words: List[str] = []
+    try:
+        for raw_word, flag in _JIEBA_PSEG.cut(text):
+            word = raw_word.strip()
+            if len(word) < 2:
+                continue
+            if _CJK_RUN_RE.fullmatch(word) is None:
+                continue
+            if not str(flag).startswith(_KEEP_POS_PREFIXES):
+                continue
+            words.append(word)
+    except Exception:  # noqa: BLE001 - 分词出错就当没分出来
+        return []
+    return words
 
 
 def extract_interest_keywords(
@@ -138,19 +215,51 @@ def extract_interest_keywords(
     ]
     filtered.sort(key=lambda item: (-item[1], -len(item[0]), item[0]))
 
-    # 去掉被更长且不弱的高频词包含的短词（例如「原神」保留、「原」丢弃）
+    # 先去掉「每次出现都被某个更长候选词完整包住」的碎片：
+    # 「器人程」的每一次出现都落在「机器人程」里面，词频必然相等，
+    # 留着只是把同一个词切成了几截。
+    surviving = [
+        (term, count)
+        for term, count in filtered
+        if not any(
+            len(other) > len(term) and term in other and other_count >= count
+            for other, other_count in filtered
+        )
+    ]
+
+    # 再去掉和已保留词大面积重叠的相邻切片（「工智能聊」vs「智能聊天」这类
+    # 互相都不是子串的窗口碎片）。
     kept: List[Tuple[str, int]] = []
-    for term, count in filtered:
-        dominated = False
-        for other, other_count in kept:
-            if len(other) > len(term) and term in other and other_count >= count:
-                dominated = True
-                break
-        if not dominated:
-            kept.append((term, count))
+    for term, count in surviving:
+        if any(_overlaps_heavily(term, other) for other, _c in kept):
+            continue
+        kept.append((term, count))
         if len(kept) >= top_n:
             break
     return kept
+
+
+def _overlaps_heavily(left: str, right: str) -> bool:
+    """两个同长度词是否大面积重叠。
+
+    滑动窗口切词会把同一句里的「智能聊天」切成「工智能聊」「智能聊天」
+    「聊天机器」……它们互相都不是子串，光靠包含判断去不掉，同时保留只会
+    让兴趣列表看起来像乱码。这里只处理**长度相同**的情况：一方有超过一半
+    的连续片段出现在另一方里就算重复。跨长度不处理——「游戏本」和「单机游戏」
+    这种共享两个字的词是真实存在的不同兴趣，不该被误杀。
+    """
+
+    if left == right:
+        return True
+    if len(left) != len(right) or len(left) < 3:
+        return False
+    size = len(left)
+    for start in range(size):
+        for end in range(start + 2, size + 1):
+            piece = left[start:end]
+            if len(piece) * 2 >= size and piece in right:
+                return True
+    return False
 
 
 def _text_from_raw_message(raw_message: Any) -> str:
@@ -197,6 +306,11 @@ class InterestProfile:
 
     def __bool__(self) -> bool:
         return bool(self.weights)
+
+    def has(self, term: str) -> bool:
+        """这个兴趣词是否已经在画像里（按归一化后的形式比较）。"""
+
+        return normalize_term(term) in self.weights
 
     def sorted_terms(self) -> List[Tuple[str, float]]:
         return sorted(self.weights.items(), key=lambda item: (-item[1], item[0]))
