@@ -72,6 +72,8 @@ _ALLOWED_STREAMS_TTL_SECONDS = 300.0
 # 自己写完 config.toml 后的保护期（秒）：这段时间内触发的重载不再跑启动轮
 _CONFIG_WRITE_GUARD_SECONDS = 180.0
 _CONFIG_WRITE_META = "last_config_write_at"
+# 每日分享计数的 meta 键前缀（后面拼 YYYY-MM-DD）
+_DAILY_SHARED_META_PREFIX = "daily_shared:"
 
 
 # ----------------------------------------------------------------------
@@ -453,6 +455,75 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
             return False
         return time.time() - stamp < _CONFIG_WRITE_GUARD_SECONDS
 
+    # -- 每日额度与「骰子」 ------------------------------------------------
+
+    @staticmethod
+    def _daily_key(now: Optional[float] = None) -> str:
+        """按自然日生成计数键，例如 daily_shared:2026-11-08。"""
+
+        stamp = time.time() if now is None else now
+        return _DAILY_SHARED_META_PREFIX + time.strftime("%Y-%m-%d", time.localtime(stamp))
+
+    def _daily_shared(self, now: Optional[float] = None) -> int:
+        """今天已经自动分享了几条（跨重启保留，过期日期自动不受影响）。"""
+
+        if self._store is None:
+            return 0
+        try:
+            return max(0, int(self._store.get_meta(self._daily_key(now), 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _bump_daily_shared(self, count: int, now: Optional[float] = None) -> None:
+        """叠加今天的分享计数。"""
+
+        if self._store is None or count <= 0:
+            return
+        key = self._daily_key(now)
+        self._store.set_meta(key, self._daily_shared(now) + int(count))
+
+    def _gate_round(self, *, manual: bool, reason: str) -> Optional[Dict[str, Any]]:
+        """自动轮次的准入检查：每日上限 + 掷骰子。
+
+        返回 None 表示放行；返回 dict 表示本轮跳过（沿用 run_round 的返回结构）。
+        手动触发的轮次（``manual=True``）完全绕过这两道闸，用户想马上看就一定看。
+        """
+
+        if manual:
+            return None
+        config = self.config
+        cap = int(config.schedule.daily_share_max or 0)
+        already = self._daily_shared()
+        if cap > 0 and already >= cap:
+            logger.info(
+                "麦麦刷B站：今天已分享 %s 条（上限 %s 条），本轮跳过", already, cap
+            )
+            return {
+                "ok": True,
+                "skipped": "daily_limit",
+                "reason": reason,
+                "fetched": 0,
+                "shared": 0,
+                "daily_shared": already,
+                "daily_max": cap,
+            }
+        chance = float(config.schedule.skip_chance or 0.0)
+        if chance > 0.0 and random.random() < chance:
+            logger.info(
+                "麦麦刷B站：本轮掷到「不看」（%.0f%% 概率），跳过（不搜索、不调用模型）",
+                chance * 100,
+            )
+            return {
+                "ok": True,
+                "skipped": "dice_skip",
+                "reason": reason,
+                "fetched": 0,
+                "shared": 0,
+                "daily_shared": already,
+                "daily_max": cap,
+            }
+        return None
+
     async def _safe_round(self, *, reason: str) -> None:
         try:
             summary = await self.run_round(reason=reason)
@@ -479,6 +550,10 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 "fetched": 0,
                 "shared": 0,
             }
+        # 每日额度 + 掷骰子（手动触发的轮次直接放行）
+        gate = self._gate_round(manual=manual, reason=reason)
+        if gate is not None:
+            return gate
         targets = [item for item in config.streams if item.enabled]
         if not targets:
             return {"ok": True, "skipped": "no_targets", "reason": reason, "fetched": 0, "shared": 0}
@@ -546,6 +621,9 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 target_details.append(detail)
                 shared.extend(detail.get("bvids") or [])
 
+            if shared:
+                self._bump_daily_shared(len(shared))
+
             summary = {
                 "ok": True,
                 "reason": reason,
@@ -556,6 +634,8 @@ class BilibiliInterestSharePlugin(MaiBotPlugin):
                 "target_count": len(resolved),
                 "at": time.time(),
                 "bvids": shared,
+                "daily_shared": self._daily_shared(),
+                "daily_max": int(config.schedule.daily_share_max or 0),
             }
             self.last_round = summary
             self.last_round_at = time.time()

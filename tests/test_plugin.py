@@ -935,7 +935,7 @@ class PluginTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults["schedule"]["interval_minutes"], 60)
         self.assertEqual(defaults["schedule"]["search_cooldown_seconds"], 300)
         self.assertTrue(defaults["plugin"]["enabled"])
-        self.assertEqual(defaults["plugin"]["config_version"], "2.0.0")
+        self.assertEqual(defaults["plugin"]["config_version"], "2.1.0")
         self.assertEqual(defaults["interest"]["llm_task_name"], "planner")
         self.assertEqual(defaults["vision"]["task_name"], "vlm")
         self.assertTrue(defaults["categories"])
@@ -1564,7 +1564,7 @@ class PackagingTest(unittest.TestCase):
             raw = tomllib.load(handle)
         plugin = load_plugin_module().BilibiliInterestSharePlugin()
         plugin.set_plugin_config(raw)  # 不应抛异常
-        self.assertEqual(plugin.config.plugin.config_version, "2.0.0")
+        self.assertEqual(plugin.config.plugin.config_version, "2.1.0")
         self.assertEqual(plugin.config.streams, [])
         self.assertTrue(plugin.config.categories)
         self.assertEqual(plugin.config.vision.task_name, "vlm")

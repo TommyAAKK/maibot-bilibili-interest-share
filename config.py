@@ -42,7 +42,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件"},
     )
     config_version: str = Field(
-        default="2.0.0",
+        default="2.1.0",
         description="配置版本（由插件维护，请勿手动修改）",
         json_schema_extra={"label": "配置版本"},
     )
@@ -92,6 +92,27 @@ class ScheduleConfig(PluginConfigBase):
         le=86400,
         description="用户主动要求搜索分享的冷却秒数（默认 300=5 分钟）；与自动分享频率互不影响",
         json_schema_extra={"label": "主动搜索冷却（秒）"},
+    )
+    skip_chance: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "每轮开始先掷一次骰子，按此概率放弃本轮（不搜索、不调用模型、不消耗额度）。"
+            "0=每轮必刷；0.3=约三成轮次「这会儿不太想看」而跳过。用户主动要求的那轮不受影响"
+        ),
+        json_schema_extra={"label": "本轮跳过概率", "placeholder": "0.3"},
+    )
+    daily_share_max: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description=(
+            "每天自动分享的总条数上限（所有白名单会话合计，按自然日统计，跨重启保留）。"
+            "0=不限制。设了上限就能把刷取间隔调短（例如 1~60 分钟），"
+            "实现「一直在看、但一天只发几条」"
+        ),
+        json_schema_extra={"label": "每日分享上限（条）", "placeholder": "3"},
     )
 
 
